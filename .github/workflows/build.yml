@@ -1,6 +1,11 @@
 name: Build Custom SumatraPDF
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build.yml'
   workflow_dispatch:
 
 jobs:
@@ -13,56 +18,78 @@ jobs:
           git config --global core.longpaths true
           git clone --recurse-submodules --depth 1 https://github.com/sumatrapdfreader/sumatrapdf.git .
 
-      - name: 2. 回归极简源码平替策略
+      - name: 2. 注入同目录字体优先加载逻辑
         shell: pwsh
         run: |
           $file = (Get-ChildItem -Path ext/mupdf -Recurse -Filter "pdf-font.c" | Select-Object -First 1).FullName
-          $content = Get-Content$file -Raw
+          Write-Host "目标文件: $file" -ForegroundColor Green
 
-          # 追加在文件最末尾的物理读取函数（放在末尾可彻底规避缺乏上下文导致的 C2143 报错）
+          $content = Get-Content -Path $file -Raw -Encoding utf8
+
+          # 1. 声明并定义本地字体物理探测函数（放在文件末尾，避免头文件缺失报错）
           $customFunc = @"
 
-// ===== 专属同目录加载逻辑 =====
+// ===== 自定义本地同级目录字体优先探测 =====
 #ifdef _WIN32
 #include <windows.h>
 fz_font *load_local_songstd(fz_context *ctx) {
-    char path[512] = {0};
-    GetModuleFileNameA(NULL, path, 512);
-    char *p = strrchr(path, '\\');
-    if(p) { 
-        *p = '\0'; 
-        strcat(path, "\\SongStd-Light.otf"); 
+    char fontPath[512] = {0};
+    if (GetModuleFileNameA(NULL, fontPath, 500)) {
+        char *p = strrchr(fontPath, '\\');
+        if (p) {
+            *p = '\0';
+            strcat(fontPath, "\\SongStd-Light.otf");
+            if (GetFileAttributesA(fontPath) != (DWORD)-1) {
+                return fz_new_font_from_file(ctx, "SongStd-Light", fontPath, 0);
+            }
+        }
     }
-    return fz_new_font_from_file(ctx, "SongStd-Light", path, 0);
+    return NULL;
 }
 #endif
 "@
-          
-          $content =$content + "`r`n" + $customFunc
+          $content = $content + "`r`n" + $customFunc
 
-          # 核心平替：利用 PowerShell 正则，将原本类似 pdf_load_windows_font(ctx, "simsun.ttc", ...) 的语句
-          # 连同括号内的参数一并切掉，直接替换为调用 load_local_songstd(ctx)
-          $content =$content -replace '[a-zA-Z0-9_]+\(ctx,\s*"simsun\.ttc"[^)]*\)', 'load_local_songstd(ctx)'
+          # 2. 前置函数声明（放在文件头部，确保原函数内可以直接调用）
+          $content = "fz_font *load_local_songstd(fz_context *ctx);`r`n" + $content
 
-          Set-Content -Path $file -Value$content
-          Write-Host "已用 load_local_songstd(ctx) 彻底平替 simsun.ttc 接口调用！" -ForegroundColor Green
+          # 3. 在 CJK 加载入口直接劫持：只要同目录存在 SongStd-Light.otf，直接返回该字体
+          $hookTarget = '(?s)(pdf_load_windows_cjk_font\s*\([^)]*\)\s*\{)'
+          $hookInject = "`$1`r`n#ifdef _WIN32`r`n    { fz_font *_f = load_local_songstd(ctx); if (_f) return _f; }`r`n#endif`r`n"
+          $content = [regex]::Replace($content, $hookTarget,$hookInject, 1)
+
+          Set-Content -Path $file -Value$content -Encoding utf8
+          Write-Host "字体拦截逻辑注入完成！" -ForegroundColor Green
 
       - name: 3. 配置 MSBuild 环境
         uses: microsoft/setup-msbuild@v2
 
-      - name: 4. 执行绝对路径编译
+      - name: 4. 执行 Release x64 编译
         shell: cmd
         run: |
           msbuild vs2022\SumatraPDF.sln /p:Configuration=Release /p:Platform=x64 /t:SumatraPDF /m
 
-      - name: 5. 提取打包
+      - name: 5. 提取打包生成物
         shell: pwsh
         run: |
-          $exePath = (Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse \vert{} Where-Object { $_.FullName -match "Release" } | Select-Object -First 1).FullName
+          $exePath = ""
+          foreach ($f in (Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse)) {
+              if ($f.FullName -match "Release") {
+                  $exePath =$f.FullName
+                  break
+              }
+          }
+          if ($exePath -eq "") {
+              foreach ($f in (Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse)) {
+                  $exePath =$f.FullName
+                  break
+              }
+          }
+          Write-Host "找到最终生成物: $exePath" -ForegroundColor Green
           New-Item -ItemType Directory -Path ./output -Force
           Copy-Item -Path $exePath -Destination ./output/SumatraPDF.exe
 
-      - name: 6. 上传 Artifact
+      - name: 6. 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: SumatraPDF-SongStd-x64
