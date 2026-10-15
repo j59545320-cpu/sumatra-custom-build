@@ -1,7 +1,7 @@
 name: Build Custom SumatraPDF
 
 on:
-  workflow_dispatch: # 支持网页端一键手动触发
+  workflow_dispatch:
 
 jobs:
   build:
@@ -21,34 +21,34 @@ jobs:
           if (-not $target) { throw "未找到 pdf-font.c！" }
           Write-Host "锁定关键文件: $($target.FullName)" -ForegroundColor Green
 
-          $content = [System.IO.File]::ReadAllText($target.FullName, [System.Text.Encoding]::UTF8)
+          $c = [System.IO.File]::ReadAllText($target.FullName, [System.Text.Encoding]::UTF8)
 
-          $injectCode = @'
-    /* --- CUSTOM FONT INJECTION START --- */
-    if (name && (strstr(name, "simsun") || strstr(name, "Song") || strstr(name, "song"))) {
-        char _custom_p[MAX_PATH];
-        if (GetModuleFileNameA(NULL, _custom_p, MAX_PATH)) {
-            char *_slash = strrchr(_custom_p, '\\');
-            if (_slash) {
-                strcpy(_slash + 1, "AdobeSongStd-Light.otf");
-                if (GetFileAttributesA(_custom_p) != (DWORD)-1) {
-                    fz_font *_cf = fz_new_font_from_file(ctx, name, _custom_p, 0);
-                    if (_cf) return _cf;
-                }
-                strcpy(_slash + 1, "SongStd-Light.otf");
-                if (GetFileAttributesA(_custom_p) != (DWORD)-1) {
-                    fz_font *_cf = fz_new_font_from_file(ctx, name, _custom_p, 0);
-                    if (_cf) return _cf;
-                }
-            }
-        }
-    }
-    /* --- CUSTOM FONT INJECTION END --- */
-'@
+          $inject = @(
+              '    /* --- CUSTOM FONT INJECTION START --- */',
+              '    if (name && (strstr(name, "simsun") || strstr(name, "Song") || strstr(name, "song"))) {',
+              '        char _p[MAX_PATH];',
+              '        if (GetModuleFileNameA(NULL, _p, MAX_PATH)) {',
+              '            char *_s = strrchr(_p, ''\\'');',
+              '            if (_s) {',
+              '                strcpy(_s + 1, "AdobeSongStd-Light.otf");',
+              '                if (GetFileAttributesA(_p) != (DWORD)-1) {',
+              '                    fz_font *_f = fz_new_font_from_file(ctx, name, _p, 0);',
+              '                    if (_f) return _f;',
+              '                }',
+              '                strcpy(_s + 1, "SongStd-Light.otf");',
+              '                if (GetFileAttributesA(_p) != (DWORD)-1) {',
+              '                    fz_font *_f = fz_new_font_from_file(ctx, name, _p, 0);',
+              '                    if (_f) return _f;',
+              '                }',
+              '            }',
+              '        }',
+              '    }',
+              '    /* --- CUSTOM FONT INJECTION END --- */'
+          ) -join "`r`n"
 
           $regex = [regex]'GetSystemWindowsDirectory'
-          if ($regex.IsMatch($content)) {
-              $patched =$regex.Replace($content, ($injectCode + "`r`n    GetSystemWindowsDirectory"), 1)
+          if ($regex.IsMatch($c)) {
+              $patched =$regex.Replace($c, ($inject + "`r`n    GetSystemWindowsDirectory"), 1)
               [System.IO.File]::WriteAllText($target.FullName, $patched, [System.Text.Encoding]::UTF8)
               Write-Host "底层硬拦截补丁注入成功！" -ForegroundColor Green
           } else {
