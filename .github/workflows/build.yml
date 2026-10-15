@@ -2,8 +2,6 @@ name: Build Custom SumatraPDF
 
 on:
   push:
-    branches:
-      - main
     paths:
       - '.github/workflows/build.yml'
   workflow_dispatch:
@@ -18,48 +16,48 @@ jobs:
           git config --global core.longpaths true
           git clone --recurse-submodules --depth 1 https://github.com/sumatrapdfreader/sumatrapdf.git .
 
-      - name: 2. 注入同目录字体优先加载逻辑
+      - name: 2. 注入同目录字体优先逻辑
         shell: pwsh
         run: |
           $file = (Get-ChildItem -Path ext/mupdf -Recurse -Filter "pdf-font.c" | Select-Object -First 1).FullName
-          Write-Host "目标文件: $file" -ForegroundColor Green
+          Write-Host "锁定源码文件: $file" -ForegroundColor Green
 
-          $content = Get-Content -Path $file -Raw -Encoding utf8
+          $c = [System.IO.File]::ReadAllText($file, [System.Text.Encoding]::UTF8)
 
-          # 1. 声明并定义本地字体物理探测函数（放在文件末尾，避免头文件缺失报错）
-          $customFunc = @"
-
-// ===== 自定义本地同级目录字体优先探测 =====
-#ifdef _WIN32
-#include <windows.h>
-fz_font *load_local_songstd(fz_context *ctx) {
-    char fontPath[512] = {0};
-    if (GetModuleFileNameA(NULL, fontPath, 500)) {
-        char *p = strrchr(fontPath, '\\');
-        if (p) {
-            *p = '\0';
-            strcat(fontPath, "\\SongStd-Light.otf");
-            if (GetFileAttributesA(fontPath) != (DWORD)-1) {
-                return fz_new_font_from_file(ctx, "SongStd-Light", fontPath, 0);
+          # 寻找原版中加载 simsun.ttc 的经典保底调用
+          # 原文通常形如: return pdf_load_windows_font(ctx, "simsun.ttc"); 或 fz_load_windows_font
+          # 我们将其替换为：优先探测同目录 SongStd-Light.otf，若存在则用 fz_new_font_from_file 加载
+          
+          $targetPattern = '(?s)return\s+(?:pdf|fz)_load_windows_font\s*\(\s*ctx\s*,\s*"simsun\.ttc"\s*\)\s*;'
+          
+          # 纯 C 内联替换代码 (已提前解析 EXE 目录，无需外部声明新函数)
+          $replaceCode = @'
+{
+    char _fp[512] = {0};
+    if (GetModuleFileNameA(NULL, _fp, 500)) {
+        char *_sep = strrchr(_fp, '\\');
+        if (_sep) {
+            *(_sep + 1) = '\0';
+            strcat(_fp, "SongStd-Light.otf");
+            if (GetFileAttributesA(_fp) != (DWORD)-1) {
+                return fz_new_font_from_file(ctx, "SongStd-Light", _fp, 0);
             }
         }
     }
-    return NULL;
+    return fz_load_windows_font(ctx, "simsun.ttc");
 }
-#endif
-"@
-          $content = $content + "`r`n" + $customFunc
+'@
 
-          # 2. 前置函数声明（放在文件头部，确保原函数内可以直接调用）
-          $content = "fz_font *load_local_songstd(fz_context *ctx);`r`n" + $content
+          if ($c -match $targetPattern) {
+              $c = [regex]::Replace($c, $targetPattern, $replaceCode, 1)
+              Write-Host "成功将 simsun.ttc 回退点升级为本地 SongStd 探针！" -ForegroundColor Green
+          } else {
+              # 保底方案：如果是直接字符串引用
+              $c = $c.Replace('"simsun.ttc"', '"SongStd-Light.otf"')
+              Write-Host "已执行直接字库名称平替！" -ForegroundColor Yellow
+          }
 
-          # 3. 在 CJK 加载入口直接劫持：只要同目录存在 SongStd-Light.otf，直接返回该字体
-          $hookTarget = '(?s)(pdf_load_windows_cjk_font\s*\([^)]*\)\s*\{)'
-          $hookInject = "`$1`r`n#ifdef _WIN32`r`n    { fz_font *_f = load_local_songstd(ctx); if (_f) return _f; }`r`n#endif`r`n"
-          $content = [regex]::Replace($content, $hookTarget,$hookInject, 1)
-
-          Set-Content -Path $file -Value$content -Encoding utf8
-          Write-Host "字体拦截逻辑注入完成！" -ForegroundColor Green
+          [System.IO.File]::WriteAllText($file, $c, [System.Text.Encoding]::UTF8)
 
       - name: 3. 配置 MSBuild 环境
         uses: microsoft/setup-msbuild@v2
@@ -75,13 +73,13 @@ fz_font *load_local_songstd(fz_context *ctx) {
           $exePath = ""
           foreach ($f in (Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse)) {
               if ($f.FullName -match "Release") {
-                  $exePath =$f.FullName
+                  $exePath = $f.FullName
                   break
               }
           }
           if ($exePath -eq "") {
               foreach ($f in (Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse)) {
-                  $exePath =$f.FullName
+                  $exePath = $f.FullName
                   break
               }
           }
