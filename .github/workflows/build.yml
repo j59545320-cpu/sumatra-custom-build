@@ -13,27 +13,46 @@ jobs:
           git config --global core.longpaths true
           git clone --recurse-submodules --depth 1 https://github.com/sumatrapdfreader/sumatrapdf.git .
 
-      - name: 2. 注入 CJK 字体优先拦截补丁 (同时兼容 SongStd 与 AdobeSongStd)
+      - name: 2. 注入 CJK 字体绝对路径优先拦截补丁
         shell: pwsh
         run: |
-          Write-Host "正在检索 MuPDF 渲染引擎中的 CJK 字体映射文件..." -ForegroundColor Cyan
-          $targetFiles = Get-ChildItem -Path ext -Recurse -Include *.c,*.cpp,*.h | Where-Object { 
-              (Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue) -match "simsun" 
-          }
+          Write-Host "正在定位 pdf-font.c ..." -ForegroundColor Cyan
+          $target = Get-ChildItem -Path ext/mupdf -Recurse -Filter "pdf-font.c" | Select-Object -First 1
+          if (-not $target) { throw "未找到 pdf-font.c！" }
+          Write-Host "锁定关键文件: $($target.FullName)" -ForegroundColor Green
 
-          if ($targetFiles) {
-              foreach ($file in $targetFiles) {
-                  Write-Host "命中关键字体文件: $($file.FullName)" -ForegroundColor Green
-                  $content = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
-                  
-                  # 级联检测：SongStd-Light.otf -> AdobeSongStd-Light.otf -> simsun.ttc
-                  $fallbackExpr = '(GetFileAttributesA("SongStd-Light.otf") != (DWORD)-1 ? "SongStd-Light.otf" : (GetFileAttributesA("AdobeSongStd-Light.otf") != (DWORD)-1 ? "AdobeSongStd-Light.otf" : "simsun.ttc"))'
-                  $patched = $content -replace '"simsun\.ttc"', $fallbackExpr
-                  [System.IO.File]::WriteAllText($file.FullName, $patched, [System.Text.Encoding]::UTF8)
-              }
-              Write-Host "补丁注入成功！" -ForegroundColor Green
+          $content = [System.IO.File]::ReadAllText($target.FullName, [System.Text.Encoding]::UTF8)
+
+          $injectCode = @'
+    /* --- CUSTOM FONT INJECTION START --- */
+    if (name && (strstr(name, "simsun") || strstr(name, "Song") || strstr(name, "song"))) {
+        char _custom_p[MAX_PATH];
+        if (GetModuleFileNameA(NULL, _custom_p, MAX_PATH)) {
+            char *_slash = strrchr(_custom_p, '\\');
+            if (_slash) {
+                strcpy(_slash + 1, "AdobeSongStd-Light.otf");
+                if (GetFileAttributesA(_custom_p) != (DWORD)-1) {
+                    fz_font *_cf = fz_new_font_from_file(ctx, name, _custom_p, 0);
+                    if (_cf) return _cf;
+                }
+                strcpy(_slash + 1, "SongStd-Light.otf");
+                if (GetFileAttributesA(_custom_p) != (DWORD)-1) {
+                    fz_font *_cf = fz_new_font_from_file(ctx, name, _custom_p, 0);
+                    if (_cf) return _cf;
+                }
+            }
+        }
+    }
+    /* --- CUSTOM FONT INJECTION END --- */
+'@
+
+          $regex = [regex]'GetSystemWindowsDirectory'
+          if ($regex.IsMatch($content)) {
+              $patched =$regex.Replace($content, ($injectCode + "`r`n    GetSystemWindowsDirectory"), 1)
+              [System.IO.File]::WriteAllText($target.FullName, $patched, [System.Text.Encoding]::UTF8)
+              Write-Host "底层硬拦截补丁注入成功！" -ForegroundColor Green
           } else {
-              Write-Host "未找到明文匹配点，跳过文本替换" -ForegroundColor Yellow
+              throw "未在 pdf-font.c 中找到 GetSystemWindowsDirectory 关键字！"
           }
 
       - name: 3. 配置编译环境 (MSBuild)
@@ -53,16 +72,14 @@ jobs:
       - name: 5. 提取并打包生成物
         shell: pwsh
         run: |
-          Write-Host "正在全盘扫描生成的 SumatraPDF.exe..." -ForegroundColor Cyan
+          Write-Host "正在扫描生成的 SumatraPDF.exe..." -ForegroundColor Cyan
           $exeList = Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse
-          $exeList | ForEach-Object { Write-Host "发现目标文件: $($_.FullName)" -ForegroundColor Green }
-          $exe = $exeList | Select-Object -First 1
+          $exe =$exeList | Select-Object -First 1
           if ($exe) {
               Write-Host "成功锁定定制版程序: $($exe.FullName)" -ForegroundColor Green
               New-Item -ItemType Directory -Path ./output -Force
               Copy-Item -Path $exe.FullName -Destination ./output/SumatraPDF.exe
           } else {
-              Get-ChildItem -Path . -Filter "*.exe" -Recurse | ForEach-Object { Write-Host "现有EXE: $($_.FullName)" }
               throw "编译未找到 SumatraPDF.exe 目标文件！"
           }
 
