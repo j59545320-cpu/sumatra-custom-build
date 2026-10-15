@@ -2,65 +2,67 @@ name: Build Custom SumatraPDF
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - '.github/workflows/build.yml'
 
 jobs:
   build:
     runs-on: windows-2022
 
     steps:
-      - name: 1. 拉取源码与子模块
+      - name: 1. 拉取源码
         run: |
           git config --global core.longpaths true
           git clone --recurse-submodules --depth 1 https://github.com/sumatrapdfreader/sumatrapdf.git .
 
-      - name: 2. 纯单行替换回退字体 (零多余语法)
+      - name: 2. 回归极简源码平替策略
         shell: pwsh
         run: |
-          $fontFiles = Get-ChildItem -Path ext/mupdf -Recurse -Include "pdf-font.c","font-win32.c"
+          $file = (Get-ChildItem -Path ext/mupdf -Recurse -Filter "pdf-font.c" | Select-Object -First 1).FullName
+          $content = Get-Content$file -Raw
+
+          # 追加在文件最末尾的物理读取函数（放在末尾可彻底规避缺乏上下文导致的 C2143 报错）
+          $customFunc = @"
+
+// ===== 专属同目录加载逻辑 =====
+#ifdef _WIN32
+#include <windows.h>
+fz_font *load_local_songstd(fz_context *ctx) {
+    char path[512] = {0};
+    GetModuleFileNameA(NULL, path, 512);
+    char *p = strrchr(path, '\\');
+    if(p) { 
+        *p = '\0'; 
+        strcat(path, "\\SongStd-Light.otf"); 
+    }
+    return fz_new_font_from_file(ctx, "SongStd-Light", path, 0);
+}
+#endif
+"@
           
-          foreach ($file in $fontFiles) {
-              $content = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
-              if ($content.Contains('"simsun.ttc"')) {
-                  Write-Host "在 $($file.Name) 中发现 simsun.ttc，执行直接替换" -ForegroundColor Green
-                  # 直接把所有回退字形指向 SongStd-Light.otf
-                  $content = $content.Replace('"simsun.ttc"', '"SongStd-Light.otf"')
-                  [System.IO.File]::WriteAllText($file.FullName, $content, [System.Text.Encoding]::UTF8)
-              }
-          }
-          Write-Host "字体名称纯净替换完成！" -ForegroundColor Green
+          $content =$content + "`r`n" + $customFunc
+
+          # 核心平替：利用 PowerShell 正则，将原本类似 pdf_load_windows_font(ctx, "simsun.ttc", ...) 的语句
+          # 连同括号内的参数一并切掉，直接替换为调用 load_local_songstd(ctx)
+          $content =$content -replace '[a-zA-Z0-9_]+\(ctx,\s*"simsun\.ttc"[^)]*\)', 'load_local_songstd(ctx)'
+
+          Set-Content -Path $file -Value$content
+          Write-Host "已用 load_local_songstd(ctx) 彻底平替 simsun.ttc 接口调用！" -ForegroundColor Green
 
       - name: 3. 配置 MSBuild 环境
         uses: microsoft/setup-msbuild@v2
 
-      - name: 4. 执行 Release x64 编译
+      - name: 4. 执行绝对路径编译
         shell: cmd
         run: |
           msbuild vs2022\SumatraPDF.sln /p:Configuration=Release /p:Platform=x64 /t:SumatraPDF /m
 
-      - name: 5. 提取打包生成物
+      - name: 5. 提取打包
         shell: pwsh
         run: |
-          $exePath = ""
-          foreach ($f in (Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse)) {
-              if ($f.FullName -match "Release") {
-                  $exePath = $f.FullName
-                  break
-              }
-          }
-          if ($exePath -eq "") {
-              foreach ($f in (Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse)) {
-                  $exePath = $f.FullName
-                  break
-              }
-          }
-          Write-Host "找到最终生成物: $exePath" -ForegroundColor Green
+          $exePath = (Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse \vert{} Where-Object { $_.FullName -match "Release" } | Select-Object -First 1).FullName
           New-Item -ItemType Directory -Path ./output -Force
           Copy-Item -Path $exePath -Destination ./output/SumatraPDF.exe
 
-      - name: 6. 上传产物
+      - name: 6. 上传 Artifact
         uses: actions/upload-artifact@v4
         with:
           name: SumatraPDF-SongStd-x64
