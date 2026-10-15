@@ -13,47 +13,65 @@ jobs:
           git config --global core.longpaths true
           git clone --recurse-submodules --depth 1 https://github.com/sumatrapdfreader/sumatrapdf.git .
 
-      - name: 2. 注入 CJK 字体绝对路径优先拦截补丁
+      - name: 2. 注入 CJK 字体绝对路径补丁 (基于已证实的 simsun 靶点)
         shell: pwsh
         run: |
-          Write-Host "正在定位 pdf-font.c ..." -ForegroundColor Cyan
-          $target = Get-ChildItem -Path ext/mupdf -Recurse -Filter "pdf-font.c" | Select-Object -First 1
-          if (-not $target) { throw "未找到 pdf-font.c！" }
-          Write-Host "锁定关键文件: $($target.FullName)" -ForegroundColor Green
+          Write-Host "正在检索包含 simsun 的源码文件..." -ForegroundColor Cyan
+          $targetFiles = Get-ChildItem -Path ext/mupdf -Recurse -Include *.c,*.cpp,*.h | Where-Object { 
+              (Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue) -match '"simsun\.ttc"' 
+          }
 
-          $c = [System.IO.File]::ReadAllText($target.FullName, [System.Text.Encoding]::UTF8)
+          if (-not $targetFiles) {
+              throw "未找到包含 simsun.ttc 的文件！"
+          }
 
-          $inject = @(
-              '    /* --- CUSTOM FONT INJECTION START --- */',
-              '    if (name && (strstr(name, "simsun") || strstr(name, "Song") || strstr(name, "song"))) {',
-              '        char _p[MAX_PATH];',
-              '        if (GetModuleFileNameA(NULL, _p, MAX_PATH)) {',
-              '            char *_s = strrchr(_p, ''\\'');',
-              '            if (_s) {',
-              '                strcpy(_s + 1, "AdobeSongStd-Light.otf");',
-              '                if (GetFileAttributesA(_p) != (DWORD)-1) {',
-              '                    fz_font *_f = fz_new_font_from_file(ctx, name, _p, 0);',
-              '                    if (_f) return _f;',
-              '                }',
-              '                strcpy(_s + 1, "SongStd-Light.otf");',
-              '                if (GetFileAttributesA(_p) != (DWORD)-1) {',
-              '                    fz_font *_f = fz_new_font_from_file(ctx, name, _p, 0);',
-              '                    if (_f) return _f;',
-              '                }',
+          # 构造纯 C 语言静态内联辅助函数：直接抓取 EXE 所在目录并拼接字体绝对路径
+          $helperCode = @(
+              '#ifdef _WIN32',
+              '#include <windows.h>',
+              'static const char* _get_custom_cjk_font(void) {',
+              '    static char _buf[512] = {0};',
+              '    if (_buf[0] == 0) {',
+              '        char _dir[512] = {0};',
+              '        if (GetModuleFileNameA(NULL, _dir, 500)) {',
+              '            char *_p = strrchr(_dir, ''\\'');',
+              '            if (_p) {',
+              '                strcpy(_p + 1, "AdobeSongStd-Light.otf");',
+              '                if (GetFileAttributesA(_dir) != (DWORD)-1) { strcpy(_buf, _dir); return _buf; }',
+              '                strcpy(_p + 1, "SongStd-Light.otf");',
+              '                if (GetFileAttributesA(_dir) != (DWORD)-1) { strcpy(_buf, _dir); return _buf; }',
               '            }',
               '        }',
+              '        strcpy(_buf, "simsun.ttc");',
               '    }',
-              '    /* --- CUSTOM FONT INJECTION END --- */'
+              '    return _buf;',
+              '}',
+              '#else',
+              '#define _get_custom_cjk_font() "simsun.ttc"',
+              '#endif',
+              ''
           ) -join "`r`n"
 
-          $regex = [regex]'GetSystemWindowsDirectory'
-          if ($regex.IsMatch($c)) {
-              $patched =$regex.Replace($c, ($inject + "`r`n    GetSystemWindowsDirectory"), 1)
-              [System.IO.File]::WriteAllText($target.FullName, $patched, [System.Text.Encoding]::UTF8)
-              Write-Host "底层硬拦截补丁注入成功！" -ForegroundColor Green
-          } else {
-              throw "未在 pdf-font.c 中找到 GetSystemWindowsDirectory 关键字！"
+          foreach ($file in$targetFiles) {
+              Write-Host "正在注入绝对路径补丁: $($file.FullName)" -ForegroundColor Green
+              $content = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
+              
+              # 1. 在文件最顶部插入获取 EXE 绝对路径的内联函数
+              # 2. 将代码中所有的 "simsun.ttc" 替换为该函数调用 _get_custom_cjk_font()
+              $patched = $helperCode + ($content -replace '"simsun\.ttc"', '_get_custom_cjk_font()')
+              
+              [System.IO.File]::WriteAllText($file.FullName, $patched, [System.Text.Encoding]::UTF8)
           }
+
+          # 同时检查 MuPDF 拼接 Windows Fonts 目录的地方，防止绝对路径被二次冠以 C:\Windows\Fonts\
+          $winFontFiles = Get-ChildItem -Path ext/mupdf,src -Recurse -Include *.c,*.cpp | Where-Object {
+              (Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue) -match '\\Fonts\\'
+          }
+          foreach ($wf in$winFontFiles) {
+              Write-Host "发现系统字体目录拼接点: $($wf.FullName)" -ForegroundColor Cyan
+          }
+
+          Write-Host "所有补丁注入完毕！" -ForegroundColor Green
 
       - name: 3. 配置编译环境 (MSBuild)
         uses: microsoft/setup-msbuild@v2
@@ -72,7 +90,7 @@ jobs:
       - name: 5. 提取并打包生成物
         shell: pwsh
         run: |
-          Write-Host "正在扫描生成的 SumatraPDF.exe..." -ForegroundColor Cyan
+          Write-Host "正在全盘扫描生成的 SumatraPDF.exe..." -ForegroundColor Cyan
           $exeList = Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse
           $exe =$exeList | Select-Object -First 1
           if ($exe) {
