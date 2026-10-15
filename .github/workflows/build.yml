@@ -16,74 +16,21 @@ jobs:
       - name: 2. 注入 CJK 字体绝对路径优先拦截补丁
         shell: pwsh
         run: |
-          Write-Host "正在检索 CJK 字体加载文件..." -ForegroundColor Cyan
-          $targetFiles = Get-ChildItem -Path ext/mupdf -Recurse -Include *.c | Where-Object { 
-              (Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue) -match 'simsun\.ttc' 
-          }
+          $file = (Get-ChildItem -Path ext/mupdf -Recurse -Filter "pdf-font.c" | Select-Object -First 1).FullName
+          Write-Host "锁定关键文件: $file" -ForegroundColor Green
+          $c = [System.IO.File]::ReadAllText($file, [System.Text.Encoding]::UTF8)
 
-          if (-not $targetFiles) {
-              throw "未找到包含 simsun.ttc 的文件！"
-          }
+          $helper = "#ifdef _WIN32`r`n#include <windows.h>`r`nstatic const char *_get_cjk_font(void) {`r`n    static char _b[512] = {0};`r`n    if (!_b[0]) {`r`n        if (GetModuleFileNameA(NULL, _b, 500)) {`r`n            char *_s = strrchr(_b, '\\');`r`n            if (_s) {`r`n                strcpy(_s + 1, `"AdobeSongStd-Light.otf`");`r`n                if (GetFileAttributesA(_b) != (DWORD)-1) return _b;`r`n                strcpy(_s + 1, `"SongStd-Light.otf`");`r`n                if (GetFileAttributesA(_b) != (DWORD)-1) return _b;`r`n            }`r`n        }`r`n        strcpy(_b, `"simsun.ttc`");`r`n    }`r`n    return _b;`r`n}`r`n#endif`r`n"
 
-          $targetFiles | ForEach-Object {
-              $filePath =$_.FullName
-              Write-Host "正在处理目标文件: $filePath" -ForegroundColor Green
-              $content = [System.IO.File]::ReadAllText($filePath, [System.Text.Encoding]::UTF8)
+          $c = $helper + $c
+          $c = $c.Replace('"simsun.ttc"', '_get_cjk_font()')
 
-              # 注入逻辑：在每次匹配 simsun 时，优先探测当前 EXE 目录下的 OTF 绝对路径
-              $hookCode = @'
-(GetFileAttributesA(([]() -> const char* {
-    static char _p[512] = {0};
-    if (!_p[0]) {
-        if (GetModuleFileNameA(NULL, _p, 500)) {
-            char *_s = strrchr(_p, '\\');
-            if (_s) {
-                strcpy(_s + 1, "AdobeSongStd-Light.otf");
-                if (GetFileAttributesA(_p) != (DWORD)-1) return _p;
-                strcpy(_s + 1, "SongStd-Light.otf");
-                if (GetFileAttributesA(_p) != (DWORD)-1) return _p;
-            }
-        }
-        strcpy(_p, "simsun.ttc");
-    }
-    return _p;
-})()) != (DWORD)-1 ? _p : "simsun.ttc")
-'@
+          $pattern = '(?s)(pdf_load_windows_font[^{]*\{[^}]*?char\s+path\[\d+\];)'
+          $replacement = "`$1`r`n    if (fontname && fontname[1] == ':') return fz_new_font_from_file(ctx, name, fontname, index);"
+          $c = [regex]::Replace($c, $pattern,$replacement, 1)
 
-              # 兼容纯 C 文件的安全替换方式：通过替换字符串直接替换为绝对路径探测
-              # 为避免 C 语法冲突，直接将文件名参数动态化
-              $replacement = '((GetModuleFileNameA(NULL, _font_buf, 500), (strrchr(_font_buf, ''\\'') ? (strcpy(strrchr(_font_buf, ''\\'') + 1, "AdobeSongStd-Light.otf"), (GetFileAttributesA(_font_buf) != (DWORD)-1 ? _font_buf : "simsun.ttc")) : "simsun.ttc")))'
-
-              # 直接将包含 simsun.ttc 的调用点做绝对路径劫持
-              $patched =$content -replace '"simsun\.ttc"', '(_get_cjk_font_path())'
-              
-              $funcDef = @(
-                  '#ifdef _WIN32',
-                  '#include <windows.h>',
-                  'static const char* _get_cjk_font_path(void) {',
-                  '    static char _b[512] = {0};',
-                  '    if (_b[0] == 0) {',
-                  '        if (GetModuleFileNameA(NULL, _b, 500)) {',
-                  '            char *_sep = strrchr(_b, ''\\'');',
-                  '            if (_sep) {',
-                  '                strcpy(_sep + 1, "AdobeSongStd-Light.otf");',
-                  '                if (GetFileAttributesA(_b) != (DWORD)-1) return _b;',
-                  '                strcpy(_sep + 1, "SongStd-Light.otf");',
-                  '                if (GetFileAttributesA(_b) != (DWORD)-1) return _b;',
-                  '            }',
-                  '        }',
-                  '        strcpy(_b, "simsun.ttc");',
-                  '    }',
-                  '    return _b;',
-                  '}',
-                  '#endif',
-                  ''
-              ) -join "`r`n"
-
-              [System.IO.File]::WriteAllText($filePath, ($funcDef +$patched), [System.Text.Encoding]::UTF8)
-          }
-
-          Write-Host "补丁注入完成！" -ForegroundColor Green
+          [System.IO.File]::WriteAllText($file,$c, [System.Text.Encoding]::UTF8)
+          Write-Host "绝对路径拦截补丁注入完成！" -ForegroundColor Green
 
       - name: 3. 配置编译环境 (MSBuild)
         uses: microsoft/setup-msbuild@v2
