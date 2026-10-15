@@ -1,0 +1,68 @@
+name: Build Custom SumatraPDF
+
+on:
+  workflow_dispatch: # 支持网页端一键手动触发
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: 1. 拉取 SumatraPDF 源码与子模块
+        run: |
+          git config --global core.longpaths true
+          git clone --recurse-submodules --depth 1 https://github.com/sumatrapdfreader/sumatrapdf.git .
+
+      - name: 2. 注入 AdobeSongStd-Light 字体优先拦截补丁
+        shell: pwsh
+        run: |
+          Write-Host "正在检索 MuPDF 渲染引擎中的 CJK 字体映射文件..." -ForegroundColor Cyan
+          $targetFiles = Get-ChildItem -Path ext -Recurse -Include *.c,*.cpp,*.h | Where-Object { 
+              (Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue) -match "simsun" 
+          }
+
+          if ($targetFiles) {
+              foreach ($file in $targetFiles) {
+                  Write-Host "命中关键字体文件: $($file.FullName)" -ForegroundColor Green
+                  $content = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
+                  
+                  # 将底层硬编码的 simsun.ttc 优先替换为读取同级目录下的 AdobeSongStd-Light.otf
+                  $patched = $content -replace '"simsun\.ttc"', '(GetFileAttributesA("AdobeSongStd-Light.otf") != (DWORD)-1 ? "AdobeSongStd-Light.otf" : "simsun.ttc")'
+                  [System.IO.File]::WriteAllText($file.FullName, $patched, [System.Text.Encoding]::UTF8)
+              }
+              Write-Host "补丁注入成功！" -ForegroundColor Green
+          } else {
+              Write-Host "未找到明文匹配点，跳过文本替换" -ForegroundColor Yellow
+          }
+
+      - name: 3. 配置编译环境 (MSBuild)
+        uses: microsoft/setup-msbuild@v2
+
+      - name: 4. 执行多线程编译 (Release x64)
+        run: |
+          if (Test-Path "vs2022/SumatraPDF.sln") {
+              msbuild vs2022/SumatraPDF.sln /p:Configuration=Release /p:Platform=x64 /m
+          } elseif (Test-Path "src/SumatraPDF.sln") {
+              msbuild src/SumatraPDF.sln /p:Configuration=Release /p:Platform=x64 /m
+          } else {
+              $sln = Get-ChildItem -Filter *.sln -Recurse | Select-Object -First 1
+              msbuild $sln.FullName /p:Configuration=Release /p:Platform=x64 /m
+          }
+
+      - name: 5. 提取并打包生成物
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse | Where-Object { $_.FullName -match "Release" } | Select-Object -First 1
+          if ($exe) {
+              Write-Host "成功生成定制版程序: $($exe.FullName)" -ForegroundColor Green
+              New-Item -ItemType Directory -Path ./output -Force
+              Copy-Item -Path $exe.FullName -Destination ./output/SumatraPDF.exe
+          } else {
+              throw "编译未找到 SumatraPDF.exe 目标文件！"
+          }
+
+      - name: 6. 上传可执行文件到 GitHub
+        uses: actions/upload-artifact@v4
+        with:
+          name: SumatraPDF-Custom-x64
+          path: ./output/SumatraPDF.exe
