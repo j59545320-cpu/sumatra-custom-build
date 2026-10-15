@@ -18,30 +18,50 @@ jobs:
           git config --global core.longpaths true
           git clone --recurse-submodules --depth 1 https://github.com/sumatrapdfreader/sumatrapdf.git .
 
-      - name: 2. 注入字体逻辑
+      - name: 2. 精准注入无损字体分流逻辑
         shell: pwsh
         run: |
-          $file = (Get-ChildItem -Path ext/mupdf -Recurse -Filter "pdf-font.c" | Select-Object -First 1).FullName
-          Write-Host "目标文件: $file" -ForegroundColor Green
+          # 扫描整个 mupdf 源码树
+          $targetFiles = Get-ChildItem -Path "ext/mupdf/source" -Recurse -Filter "*.c"
+          $patchedCount = 0
 
-          $c = [System.IO.File]::ReadAllText($file, [System.Text.Encoding]::UTF8)
+          foreach ($f in $targetFiles) {
+              $txt = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
+              $modified = $false
 
-          # 采用 Base64 彻底隔离所有特殊符号，杜绝 YAML 解析故障
-          $b64 = "ewogICAgY2hhciBfZnBbNTEyXSA9IHswfTsKICAgIGlmIChHZXRNb2R1bGVGaWxlTmFtZUEoTlVMTCwgX2ZwLCA1MDApKSB7CiAgICAgICAgY2hhciAqX3NlcCA9IHN0cnJjaHIoX2ZwLCAnXFwnKTsKICAgICAgICBpZiAoX3NlcCkgewogICAgICAgICAgICAqKF9zZXAgKyAxKSA9ICdcMCc7CiAgICAgICAgICAgIHN0cmNhdChfZnAsICJTb25nU3RkLUxpZ2h0Lm90ZiIpOwogICAgICAgICAgICBpZiAoR2V0RmlsZUF0dHJpYnV0ZXNBIChfZnApICE9IChEV09SRCktMSkgewogICAgICAgICAgICAgICAgcmV0dXJuIGZ6X25ld19mb250X2Zyb21fZmlsZShjdHgsICJTb25nU3RkLUxpZ2h0IiwgX2ZwLCAwKTsKICAgICAgICAgICAgfQogICAgICAgIH0KICAgIH0KICAgIHJldHVybiBmel9sb2FkX3dpbmRvd3NfZm9udChjdHgsICJzaW1zdW4udHRjIik7Cn0="
-          $bytes = [System.Convert]::FromBase64String($b64)
-          $patch = [System.Text.Encoding]::UTF8.GetString($bytes)
+              # 1. 将回退目标中的 simsun.ttc 替换为 SongStd-Light.otf
+              if ($txt -match '(?i)"simsun\.ttc"') {
+                  Write-Host "在 $($f.Name) 中定位到 simsun.ttc，执行替换..." -ForegroundColor Cyan
+                  $txt = $txt -replace '(?i)"simsun\.ttc"', '"SongStd-Light.otf"'
+                  $modified = $true
+                  $patchedCount++
+              }
 
-          $pattern = '(?s)return\s+(?:pdf|fz)_load_windows_font\s*\(\s*ctx\s*,\s*"simsun\.ttc"\s*\)\s*;'
+              # 2. 在文件读取最底层或路径查找处：如果文件不在 C:\Windows\Fonts 下，则去 EXE 同级目录找
+              # 拦截 fz_new_font_from_file，增加同级目录自动兜底（不影响已存在的系统字体！）
+              if ($f.Name -eq "font.c" -and $txt -match 'fz_new_font_from_file\s*\([^)]+\)\s*\{') {
+                  Write-Host "在 font.c 注入本地同级目录智能兜底..." -ForegroundColor Green
+                  
+                  # Base64 编码的无损判断逻辑：
+                  # 只有当传入的 path 包含 SongStd-Light.otf，或者在 C:\Windows\Fonts 下找不到该文件时，
+                  # 才去当前 EXE 目录下拼接路径读取；如果系统盘里有（比如正文的黑体、楷体），直接原样放行！
+                  $b64Hook = "CiAgICBjaGFyIF9sb2NhbFBhdGhbNTEyXSA9IHswfTsKICAgIGlmIChwYXRoICYmIChzdHJzdHIocGF0aCwgIlNvbmdTdGQtTGlnaHQub3RmIikgfHwgaW5kZXggPT0gMCkpIHsKICAgICAgICBpZiAoR2V0RmlsZUF0dHJpYnV0ZXNBKHBhdGgpID09IChEV09SRCktMSkgewogICAgICAgICAgICBpZiAoR2V0TW9kdWxlRmlsZU5hbWVhKE5VTEwsIF9sb2NhbFBhdGgsIDUwMCkpIHsKICAgICAgICAgICAgICAgIGNoYXIgKl9wID0gc3RycmNocihfbG9jYWxQYXRoLCAnXFwnKTsKICAgICAgICAgICAgICAgIGlmIChfcCkgewogICAgICAgICAgICAgICAgICAgICooX3AgKyAxKSA9ICdcMCc7CiAgICAgICAgICAgICAgICAgICAgc3RyY2F0KF9sb2NhbFBhdGgsICJTb25nU3RkLUxpZ2h0Lm90ZiIpOwogICAgICAgICAgICAgICAgICAgIGlmIChHZXRGaWxlQXR0cmlidXRlc0EoX2xvY2FsUGF0aCkgIT0gKERXT1JEKS0xKSB7CiAgICAgICAgICAgICAgICAgICAgICAgIHBhdGggPSBfbG9jYWxQYXRoOwogICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgfQogICAgICAgIH0KICAgIH0K"
+                  # 注意：修正 GetModuleFileNameA 大小写拼写
+                  $hookCode = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($b64Hook)).Replace("GetModuleFileNamea", "GetModuleFileNameA")
+                  
+                  $txt = [regex]::Replace($txt, '(?s)(fz_new_font_from_file\s*\([^)]+\)\s*\{)', "`$1`r`n$hookCode", 1)
+                  $modified = $true$patchedCount++
+              }
 
-          if ($c -match $pattern) {
-              $c = [regex]::Replace($c, $pattern, $patch, 1)
-              Write-Host "成功替换 simsun 调用点" -ForegroundColor Green
-          } else {
-              $c = $c.Replace('"simsun.ttc"', '"SongStd-Light.otf"')
-              Write-Host "执行名称替换" -ForegroundColor Yellow
+              if ($modified) {
+                  [System.IO.File]::WriteAllText($f.FullName, $txt, [System.Text.Encoding]::UTF8)
+              }
           }
 
-          [System.IO.File]::WriteAllText($file, $c, [System.Text.Encoding]::UTF8)
+          if ($patchedCount -eq 0) {
+              Write-Error "未命中目标代码，停止编译！"
+              exit 1
+          }
 
       - name: 3. 配置 MSBuild 环境
         uses: microsoft/setup-msbuild@v2
@@ -54,20 +74,7 @@ jobs:
       - name: 5. 提取打包生成物
         shell: pwsh
         run: |
-          $exePath = ""
-          foreach ($f in (Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse)) {
-              if ($f.FullName -match "Release") {
-                  $exePath = $f.FullName
-                  break
-              }
-          }
-          if ($exePath -eq "") {
-              foreach ($f in (Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse)) {
-                  $exePath = $f.FullName
-                  break
-              }
-          }
-          Write-Host "找到最终生成物: $exePath" -ForegroundColor Green
+          $exePath = (Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse \vert{} Where-Object { $_.FullName -match "Release" } | Select-Object -First 1).FullName
           New-Item -ItemType Directory -Path ./output -Force
           Copy-Item -Path $exePath -Destination ./output/SumatraPDF.exe
 
