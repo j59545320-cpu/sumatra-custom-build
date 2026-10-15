@@ -16,60 +16,65 @@ jobs:
           git config --global core.longpaths true
           git clone --recurse-submodules --depth 1 https://github.com/sumatrapdfreader/sumatrapdf.git .
 
-      - name: 2. 注入字体拦截补丁
+      - name: 2. 注入字体拦截补丁 (防转义版)
         shell: pwsh
         run: |
-          # 寻找核心源码
-          $target = Get-ChildItem -Path ext/mupdf -Recurse -Filter "pdf-font.c" | Select-Object -First 1
-          if (-not $target) {
-              $target = Get-ChildItem -Path ext/mupdf -Recurse -Filter "font-win32.c" | Select-Object -First 1
+          $target = ""
+          foreach ($f in (Get-ChildItem -Path ext/mupdf -Recurse -Filter "pdf-font.c")) {
+              $target = $f.FullName
+              break
           }
-          Write-Host "命中目标文件: $($target.FullName)" -ForegroundColor Green
+          if ($target -eq "") {
+              foreach ($f in (Get-ChildItem -Path ext/mupdf -Recurse -Filter "font-win32.c")) {
+                  $target = $f.FullName
+                  break
+              }
+          }
+          Write-Host "锁定目标文件: $target" -ForegroundColor Green
 
-          $c = [System.IO.File]::ReadAllText($target.FullName, [System.Text.Encoding]::UTF8)
+          $c = [System.IO.File]::ReadAllText($target, [System.Text.Encoding]::UTF8)
 
-          # 准备注入函数 (通过 Base64 规避所有 YAML 引号和转义陷阱)
           $b64 = "I2lmZGVmIF9XSU4zMgojaW5jbHVkZSA8d2luZG93cy5oPgpzdGF0aWMgZnpfZm9udCAqX2xvYWRfbG9jYWxfc29uZ3N0ZChmel9jb250ZXh0ICpjdHgpIHsKICAgIGNoYXIgZls1MTJdID0gezB9OwogICAgaWYgKEdldE1vZHVsZUZpbGVOYW1lQShOVUxMLCBmLCA1MDApKSB7CiAgICAgICAgY2hhciAqcCA9IHN0cnJjaHIoZiwgJ1xcJyk7CiAgICAgICAgaWYgKHApIHsKICAgICAgICAgICAgKnAgPSAnXDAnOwogICAgICAgICAgICBzdHJjYXQoZiwgIlxcU29uZ1N0ZC1MaWdodC5vdGYiKTsKICAgICAgICAgICAgaWYgKEdldEZpbGVBdHRyaWJ1dGVzQShmKSAhPSAoRFdPUkQpLTEpIHsKICAgICAgICAgICAgICAgIHJldHVybiBmel9uZXdfZm9udF9mcm9tX2ZpbGUoY3R4LCAiU29uZ1N0ZC1MaWdodCIsIGYsIDApOwogICAgICAgICAgICB9CiAgICAgICAgfQogICAgfQogICAgcmV0dXJuIE5VTEw7Cn0KI2VuZGlmCg=="
           $bytes = [System.Convert]::FromBase64String($b64)
           $funcCode = [System.Text.Encoding]::UTF8.GetString($bytes)
 
-          # 插入到文件开头
           $c = $funcCode + "`r`n" + $c
-
-          # 在 CJK 字体加载入口前置拦截
           $hookRegex = '(?s)(fz_font\s*\*\s*(?:fz_load_system_cjk_font|pdf_load_windows_cjk_font|pdf_load_windows_font)\s*\([^)]*\)\s*\{)'
           $hookBody = "`$1`r`n#ifdef _WIN32`r`n    { fz_font *_f = _load_local_songstd(ctx); if (_f) return _f; }`r`n#endif`r`n"
 
           $c = [regex]::Replace($c, $hookRegex,$hookBody, 1)
-          [System.IO.File]::WriteAllText($target.FullName, $c, [System.Text.Encoding]::UTF8)
-          Write-Host "补丁安全写入完成！" -ForegroundColor Green
+          [System.IO.File]::WriteAllText($target,$c, [System.Text.Encoding]::UTF8)
+          Write-Host "补丁写入成功！" -ForegroundColor Green
 
       - name: 3. 配置 MSBuild 环境
         uses: microsoft/setup-msbuild@v2
 
-      - name: 4. 执行 Release x64 编译
+      - name: 4. 执行 Release x64 编译 (纯 cmd 绝对路径)
+        shell: cmd
+        run: |
+          msbuild vs2022\SumatraPDF.sln /p:Configuration=Release /p:Platform=x64 /t:SumatraPDF /m
+
+      - name: 5. 提取打包生成物 (防转义版)
         shell: pwsh
         run: |
-          # 准确锁定 SumatraPDF 主工程（规避第三方子模块中的 .sln）
-          $mainSln = @( "vs2022/SumatraPDF.sln", "src/SumatraPDF.sln", "SumatraPDF.sln" ) \vert{} Where-Object { Test-Path $_ } | Select-Object -First 1
-
-          if (-not $mainSln) {$mainSln = (Get-ChildItem -Path . -Filter "SumatraPDF.sln" -Recurse | Select-Object -First 1).FullName
+          $exePath = ""
+          foreach ($f in (Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse)) {
+              if ($f.FullName -match "Release") {
+                  $exePath =$f.FullName
+                  break
+              }
           }
-
-          Write-Host "锁定主工程文件: $mainSln" -ForegroundColor Green
-          msbuild $mainSln /p:Configuration=Release /p:Platform=x64 /t:SumatraPDF /m
-
-      - name: 5. 提取打包生成物
-        shell: pwsh
-        run: |
-          $exe = (Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse \vert{} Where-Object { $_.FullName -match "Release" } | Select-Object -First 1).FullName
-          if (-not $exe) {$exe = (Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse | Select-Object -First 1).FullName
+          if ($exePath -eq "") {
+              foreach ($f in (Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse)) {
+                  $exePath =$f.FullName
+                  break
+              }
           }
-          Write-Host "找到最终生成物: $exe" -ForegroundColor Green
+          Write-Host "找到最终生成物: $exePath" -ForegroundColor Green
           New-Item -ItemType Directory -Path ./output -Force
-          Copy-Item -Path $exe -Destination ./output/SumatraPDF.exe
+          Copy-Item -Path $exePath -Destination ./output/SumatraPDF.exe
 
-      - name: 6. 上传 Artifact
+      - name: 6. 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: SumatraPDF-SongStd-x64
