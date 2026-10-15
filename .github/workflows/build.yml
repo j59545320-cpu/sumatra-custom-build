@@ -53,12 +53,16 @@ jobs:
       - name: 5. 提取并打包生成物
         shell: pwsh
         run: |
-          $exe = Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse | Where-Object { $_.FullName -match "Release" } | Select-Object -First 1
+          Write-Host "正在全盘扫描生成的 SumatraPDF.exe..." -ForegroundColor Cyan
+          $exeList = Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse
+          $exeList | ForEach-Object { Write-Host "发现目标文件: $($_.FullName)" -ForegroundColor Green }
+          $exe = $exeList | Select-Object -First 1
           if ($exe) {
-              Write-Host "成功生成定制版程序: $($exe.FullName)" -ForegroundColor Green
+              Write-Host "成功锁定定制版程序: $($exe.FullName)" -ForegroundColor Green
               New-Item -ItemType Directory -Path ./output -Force
               Copy-Item -Path $exe.FullName -Destination ./output/SumatraPDF.exe
           } else {
+              Get-ChildItem -Path . -Filter "*.exe" -Recurse | ForEach-Object { Write-Host "现有EXE: $($_.FullName)" }
               throw "编译未找到 SumatraPDF.exe 目标文件！"
           }
 
