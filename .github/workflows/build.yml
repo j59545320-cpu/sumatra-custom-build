@@ -13,65 +13,77 @@ jobs:
           git config --global core.longpaths true
           git clone --recurse-submodules --depth 1 https://github.com/sumatrapdfreader/sumatrapdf.git .
 
-      - name: 2. 注入 CJK 字体绝对路径补丁 (基于已证实的 simsun 靶点)
+      - name: 2. 注入 CJK 字体绝对路径优先拦截补丁
         shell: pwsh
         run: |
-          Write-Host "正在检索包含 simsun 的源码文件..." -ForegroundColor Cyan
-          $targetFiles = Get-ChildItem -Path ext/mupdf -Recurse -Include *.c,*.cpp,*.h | Where-Object { 
-              (Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue) -match '"simsun\.ttc"' 
+          Write-Host "正在检索 CJK 字体加载文件..." -ForegroundColor Cyan
+          $targetFiles = Get-ChildItem -Path ext/mupdf -Recurse -Include *.c | Where-Object { 
+              (Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue) -match 'simsun\.ttc' 
           }
 
           if (-not $targetFiles) {
               throw "未找到包含 simsun.ttc 的文件！"
           }
 
-          # 构造纯 C 语言静态内联辅助函数：直接抓取 EXE 所在目录并拼接字体绝对路径
-          $helperCode = @(
-              '#ifdef _WIN32',
-              '#include <windows.h>',
-              'static const char* _get_custom_cjk_font(void) {',
-              '    static char _buf[512] = {0};',
-              '    if (_buf[0] == 0) {',
-              '        char _dir[512] = {0};',
-              '        if (GetModuleFileNameA(NULL, _dir, 500)) {',
-              '            char *_p = strrchr(_dir, ''\\'');',
-              '            if (_p) {',
-              '                strcpy(_p + 1, "AdobeSongStd-Light.otf");',
-              '                if (GetFileAttributesA(_dir) != (DWORD)-1) { strcpy(_buf, _dir); return _buf; }',
-              '                strcpy(_p + 1, "SongStd-Light.otf");',
-              '                if (GetFileAttributesA(_dir) != (DWORD)-1) { strcpy(_buf, _dir); return _buf; }',
-              '            }',
-              '        }',
-              '        strcpy(_buf, "simsun.ttc");',
-              '    }',
-              '    return _buf;',
-              '}',
-              '#else',
-              '#define _get_custom_cjk_font() "simsun.ttc"',
-              '#endif',
-              ''
-          ) -join "`r`n"
+          $targetFiles | ForEach-Object {
+              $filePath =$_.FullName
+              Write-Host "正在处理目标文件: $filePath" -ForegroundColor Green
+              $content = [System.IO.File]::ReadAllText($filePath, [System.Text.Encoding]::UTF8)
 
-          foreach ($file in$targetFiles) {
-              Write-Host "正在注入绝对路径补丁: $($file.FullName)" -ForegroundColor Green
-              $content = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
+              # 注入逻辑：在每次匹配 simsun 时，优先探测当前 EXE 目录下的 OTF 绝对路径
+              $hookCode = @'
+(GetFileAttributesA(([]() -> const char* {
+    static char _p[512] = {0};
+    if (!_p[0]) {
+        if (GetModuleFileNameA(NULL, _p, 500)) {
+            char *_s = strrchr(_p, '\\');
+            if (_s) {
+                strcpy(_s + 1, "AdobeSongStd-Light.otf");
+                if (GetFileAttributesA(_p) != (DWORD)-1) return _p;
+                strcpy(_s + 1, "SongStd-Light.otf");
+                if (GetFileAttributesA(_p) != (DWORD)-1) return _p;
+            }
+        }
+        strcpy(_p, "simsun.ttc");
+    }
+    return _p;
+})()) != (DWORD)-1 ? _p : "simsun.ttc")
+'@
+
+              # 兼容纯 C 文件的安全替换方式：通过替换字符串直接替换为绝对路径探测
+              # 为避免 C 语法冲突，直接将文件名参数动态化
+              $replacement = '((GetModuleFileNameA(NULL, _font_buf, 500), (strrchr(_font_buf, ''\\'') ? (strcpy(strrchr(_font_buf, ''\\'') + 1, "AdobeSongStd-Light.otf"), (GetFileAttributesA(_font_buf) != (DWORD)-1 ? _font_buf : "simsun.ttc")) : "simsun.ttc")))'
+
+              # 直接将包含 simsun.ttc 的调用点做绝对路径劫持
+              $patched =$content -replace '"simsun\.ttc"', '(_get_cjk_font_path())'
               
-              # 1. 在文件最顶部插入获取 EXE 绝对路径的内联函数
-              # 2. 将代码中所有的 "simsun.ttc" 替换为该函数调用 _get_custom_cjk_font()
-              $patched = $helperCode + ($content -replace '"simsun\.ttc"', '_get_custom_cjk_font()')
-              
-              [System.IO.File]::WriteAllText($file.FullName, $patched, [System.Text.Encoding]::UTF8)
+              $funcDef = @(
+                  '#ifdef _WIN32',
+                  '#include <windows.h>',
+                  'static const char* _get_cjk_font_path(void) {',
+                  '    static char _b[512] = {0};',
+                  '    if (_b[0] == 0) {',
+                  '        if (GetModuleFileNameA(NULL, _b, 500)) {',
+                  '            char *_sep = strrchr(_b, ''\\'');',
+                  '            if (_sep) {',
+                  '                strcpy(_sep + 1, "AdobeSongStd-Light.otf");',
+                  '                if (GetFileAttributesA(_b) != (DWORD)-1) return _b;',
+                  '                strcpy(_sep + 1, "SongStd-Light.otf");',
+                  '                if (GetFileAttributesA(_b) != (DWORD)-1) return _b;',
+                  '            }',
+                  '        }',
+                  '        strcpy(_b, "simsun.ttc");',
+                  '    }',
+                  '    return _b;',
+                  '}',
+                  '#endif',
+                  ''
+              ) -join "`r`n"
+
+              [System.IO.File]::WriteAllText($filePath, ($funcDef +$patched), [System.Text.Encoding]::UTF8)
           }
 
-          # 同时检查 MuPDF 拼接 Windows Fonts 目录的地方，防止绝对路径被二次冠以 C:\Windows\Fonts\
-          $winFontFiles = Get-ChildItem -Path ext/mupdf,src -Recurse -Include *.c,*.cpp | Where-Object {
-              (Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue) -match '\\Fonts\\'
-          }
-          foreach ($wf in$winFontFiles) {
-              Write-Host "发现系统字体目录拼接点: $($wf.FullName)" -ForegroundColor Cyan
-          }
-
-          Write-Host "所有补丁注入完毕！" -ForegroundColor Green
+          Write-Host "补丁注入完成！" -ForegroundColor Green
 
       - name: 3. 配置编译环境 (MSBuild)
         uses: microsoft/setup-msbuild@v2
@@ -90,7 +102,7 @@ jobs:
       - name: 5. 提取并打包生成物
         shell: pwsh
         run: |
-          Write-Host "正在全盘扫描生成的 SumatraPDF.exe..." -ForegroundColor Cyan
+          Write-Host "正在扫描生成的 SumatraPDF.exe..." -ForegroundColor Cyan
           $exeList = Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse
           $exe =$exeList | Select-Object -First 1
           if ($exe) {
