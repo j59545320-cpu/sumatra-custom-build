@@ -13,26 +13,64 @@ jobs:
           git config --global core.longpaths true
           git clone --recurse-submodules --depth 1 https://github.com/sumatrapdfreader/sumatrapdf.git .
 
-      - name: 2. 注入 CJK 字体绝对路径优先拦截补丁
+      - name: 2. 注入 SongStd-Light.otf 物理路径硬拦截
         shell: pwsh
         run: |
-          $file = (Get-ChildItem -Path ext/mupdf -Recurse -Filter "pdf-font.c" | Select-Object -First 1).FullName
-          Write-Host "锁定关键文件: $file" -ForegroundColor Green
-          $c = [System.IO.File]::ReadAllText($file, [System.Text.Encoding]::UTF8)
+          # 检索 MuPDF 字体管理的核心源文件
+          $fontFiles = Get-ChildItem -Path ext/mupdf -Recurse -Include "font-win32.c","pdf-font.c","font.c"
+          $patched =$false
 
-          $helper = "#ifdef _WIN32`r`n#include <windows.h>`r`nstatic const char *_get_cjk_font(void) {`r`n    static char _b[512] = {0};`r`n    if (!_b[0]) {`r`n        if (GetModuleFileNameA(NULL, _b, 500)) {`r`n            char *_s = strrchr(_b, '\\');`r`n            if (_s) {`r`n                strcpy(_s + 1, `"AdobeSongStd-Light.otf`");`r`n                if (GetFileAttributesA(_b) != (DWORD)-1) return _b;`r`n                strcpy(_s + 1, `"SongStd-Light.otf`");`r`n                if (GetFileAttributesA(_b) != (DWORD)-1) return _b;`r`n            }`r`n        }`r`n        strcpy(_b, `"simsun.ttc`");`r`n    }`r`n    return _b;`r`n}`r`n#endif`r`n"
+          foreach ($f in$fontFiles) {
+              $text = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
+              
+              # 匹配系统 CJK 字体加载的底层入口
+              if ($text -match 'fz_load_system_cjk_font|pdf_load_windows_cjk_font') {
+                  Write-Host "命中目标字体加载文件: $($f.FullName)" -ForegroundColor Green
+                  
+                  # 注入物理检查函数：优先读取 EXE 同目录下的 SongStd-Light.otf
+                  $injectCode = @'
+#ifdef _WIN32
+#include <windows.h>
+static fz_font *_load_local_songstd(fz_context *ctx) {
+    char font_path[512] = {0};
+    if (GetModuleFileNameA(NULL, font_path, 500)) {
+        char *p = strrchr(font_path, '\\');
+        if (p) {
+            *p = '\0';
+            // 精确匹配 SongStd-Light.otf
+            strcat(font_path, "\\SongStd-Light.otf");
+            if (GetFileAttributesA(font_path) != (DWORD)-1) {
+                return fz_new_font_from_file(ctx, "SongStd-Light", font_path, 0);
+            }
+        }
+    }
+    return NULL;
+}
+#endif
+'@
+                  # 在函数开头直接插入拦截点，避开系统的 simsun.ttc 回退
+                  $hookRegex = '(?s)(fz_font\s*\*\s*(?:fz_load_system_cjk_font|pdf_load_windows_cjk_font)\s*\([^)]*\)\s*\{)'
+                  $hookBody = @'
+$1
+#ifdef _WIN32
+    {
+        fz_font *_f = _load_local_songstd(ctx);
+        if (_f) return _f;
+    }
+#endif
+'@
+                  $newText =$injectCode + "`r`n" + [regex]::Replace($text, $hookRegex,$hookBody, 1)
+                  [System.IO.File]::WriteAllText($f.FullName, $newText, [System.Text.Encoding]::UTF8)
+                  $patched =$true
+                  Write-Host "成功为 $($f.Name) 注入 SongStd-Light.otf 优先加载！" -ForegroundColor Green
+              }
+          }
 
-          $c = $helper + $c
-          $c = $c.Replace('"simsun.ttc"', '_get_cjk_font()')
+          if (-not $patched) {
+              throw "未找到 MuPDF 字体装配入口，请核对仓库版本！"
+          }
 
-          $pattern = '(?s)(pdf_load_windows_font[^{]*\{[^}]*?char\s+path\[\d+\];)'
-          $replacement = "`$1`r`n    if (fontname && fontname[1] == ':') return fz_new_font_from_file(ctx, name, fontname, index);"
-          $c = [regex]::Replace($c, $pattern,$replacement, 1)
-
-          [System.IO.File]::WriteAllText($file,$c, [System.Text.Encoding]::UTF8)
-          Write-Host "绝对路径拦截补丁注入完成！" -ForegroundColor Green
-
-      - name: 3. 配置编译环境 (MSBuild)
+      - name: 3. 配置 MSBuild 环境
         uses: microsoft/setup-msbuild@v2
 
       - name: 4. 执行多线程编译 (Release x64)
@@ -46,22 +84,20 @@ jobs:
               msbuild $sln.FullName /p:Configuration=Release /p:Platform=x64 /t:SumatraPDF /m
           }
 
-      - name: 5. 提取并打包生成物
+      - name: 5. 提取生成物
         shell: pwsh
         run: |
-          Write-Host "正在扫描生成的 SumatraPDF.exe..." -ForegroundColor Cyan
-          $exeList = Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse
-          $exe =$exeList | Select-Object -First 1
+          $exe = (Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse | Select-Object -First 1)
           if ($exe) {
-              Write-Host "成功锁定定制版程序: $($exe.FullName)" -ForegroundColor Green
               New-Item -ItemType Directory -Path ./output -Force
               Copy-Item -Path $exe.FullName -Destination ./output/SumatraPDF.exe
+              Write-Host "定制版 SumatraPDF.exe 编译打包完成！" -ForegroundColor Green
           } else {
-              throw "编译未找到 SumatraPDF.exe 目标文件！"
+              throw "未检索到 SumatraPDF.exe 目标文件！"
           }
 
-      - name: 6. 上传可执行文件到 GitHub
+      - name: 6. 上传 Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SumatraPDF-Custom-x64
+          name: SumatraPDF-SongStd-x64
           path: ./output/SumatraPDF.exe
