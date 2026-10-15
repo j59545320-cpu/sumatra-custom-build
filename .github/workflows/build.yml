@@ -16,7 +16,7 @@ jobs:
           git config --global core.longpaths true
           git clone --recurse-submodules --depth 1 https://github.com/sumatrapdfreader/sumatrapdf.git .
 
-      - name: 2. 注入字体拦截补丁 (防转义版)
+      - name: 2. 注入字体拦截补丁 (精准挂载版)
         shell: pwsh
         run: |
           $target = ""
@@ -34,27 +34,29 @@ jobs:
 
           $c = [System.IO.File]::ReadAllText($target, [System.Text.Encoding]::UTF8)
 
-          $b64 = "I2lmZGVmIF9XSU4zMgojaW5jbHVkZSA8d2luZG93cy5oPgpzdGF0aWMgZnpfZm9udCAqX2xvYWRfbG9jYWxfc29uZ3N0ZChmel9jb250ZXh0ICpjdHgpIHsKICAgIGNoYXIgZls1MTJdID0gezB9OwogICAgaWYgKEdldE1vZHVsZUZpbGVOYW1lQShOVUxMLCBmLCA1MDApKSB7CiAgICAgICAgY2hhciAqcCA9IHN0cnJjaHIoZiwgJ1xcJyk7CiAgICAgICAgaWYgKHApIHsKICAgICAgICAgICAgKnAgPSAnXDAnOwogICAgICAgICAgICBzdHJjYXQoZiwgIlxcU29uZ1N0ZC1MaWdodC5vdGYiKTsKICAgICAgICAgICAgaWYgKEdldEZpbGVBdHRyaWJ1dGVzQShmKSAhPSAoRFdPUkQpLTEpIHsKICAgICAgICAgICAgICAgIHJldHVybiBmel9uZXdfZm9udF9mcm9tX2ZpbGUoY3R4LCAiU29uZ1N0ZC1MaWdodCIsIGYsIDApOwogICAgICAgICAgICB9CiAgICAgICAgfQogICAgfQogICAgcmV0dXJuIE5VTEw7Cn0KI2VuZGlmCg=="
+          # 纯 C 探测代码 (Base64 防转义)
+          $b64 = "I2lmZGVmIF9XSU4zMgojaW5jbHVkZSA8d2luZG93cy5oPgpzdGF0aWMgZnpfZm9udCAqX2xvYWRfbG9jYWxfc29uZ3N0ZChmel9jb250ZXh0ICpjdHgpIHsKICAgIGNoYXIgZls1MTJdID0gezB9OwogICAgaWYgKEdldE1vZHVsZUZpbGVOYW1lQShOVUxMLCBmLCA1MDApKSB7CiAgICAgICAgY2hhciAqcCA9IHN0cnJjaHIoZiwgJ1xcJyk7CiAgICAgICAgaWYgKHApIHsKICAgICAgICAgICAgKnAgPSAnXDAnOwogICAgICAgICAgICBzdHJjYXQoZiwgIlxcU29uZ1N0ZC1MaWdodC5vdGYiKTsKICAgICAgICAgICAgaWYgKEdldEZpbGVBdHRyaWJ1dGVzQShmKSAhPSAoRFdPUkQpLTEpIHsKICAgICAgICAgICAgICAgIHJldHVybiBmel9uZXdfZm9udF9mcm9tX2ZpbGUoY3R4LCAiU29uZ1N0ZC1MaWdodCIsIGYsIDApOwogICAgICAgICAgICB9CiAgICAgICAgfQogICAgfQogICAgcmV0dXJuIE5VTEw7Cn0KI2VuZGlm"
           $bytes = [System.Convert]::FromBase64String($b64)
           $funcCode = [System.Text.Encoding]::UTF8.GetString($bytes)
 
-          $c = $funcCode + "`r`n" + $c
+          # 【关键修复】不再强行塞入文件开头！
+          # 而是将辅助函数定义与拦截器一起，精准替换到目标函数的定义处
           $hookRegex = '(?s)(fz_font\s*\*\s*(?:fz_load_system_cjk_font|pdf_load_windows_cjk_font|pdf_load_windows_font)\s*\([^)]*\)\s*\{)'
-          $hookBody = "`$1`r`n#ifdef _WIN32`r`n    { fz_font *_f = _load_local_songstd(ctx); if (_f) return _f; }`r`n#endif`r`n"
+          $hookBody = "$funcCode`r`n`$1`r`n#ifdef _WIN32`r`n    { fz_font *_f = _load_local_songstd(ctx); if (_f) return _f; }`r`n#endif`r`n"
 
           $c = [regex]::Replace($c, $hookRegex,$hookBody, 1)
           [System.IO.File]::WriteAllText($target,$c, [System.Text.Encoding]::UTF8)
-          Write-Host "补丁写入成功！" -ForegroundColor Green
+          Write-Host "补丁精准注入成功！" -ForegroundColor Green
 
       - name: 3. 配置 MSBuild 环境
         uses: microsoft/setup-msbuild@v2
 
-      - name: 4. 执行 Release x64 编译 (纯 cmd 绝对路径)
+      - name: 4. 执行 Release x64 编译
         shell: cmd
         run: |
           msbuild vs2022\SumatraPDF.sln /p:Configuration=Release /p:Platform=x64 /t:SumatraPDF /m
 
-      - name: 5. 提取打包生成物 (防转义版)
+      - name: 5. 提取打包生成物
         shell: pwsh
         run: |
           $exePath = ""
