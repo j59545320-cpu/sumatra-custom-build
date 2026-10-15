@@ -13,7 +13,7 @@ jobs:
           git config --global core.longpaths true
           git clone --recurse-submodules --depth 1 https://github.com/sumatrapdfreader/sumatrapdf.git .
 
-      - name: 2. 注入 AdobeSongStd-Light 字体优先拦截补丁
+      - name: 2. 注入 CJK 字体优先拦截补丁 (同时兼容 SongStd 与 AdobeSongStd)
         shell: pwsh
         run: |
           Write-Host "正在检索 MuPDF 渲染引擎中的 CJK 字体映射文件..." -ForegroundColor Cyan
@@ -26,8 +26,9 @@ jobs:
                   Write-Host "命中关键字体文件: $($file.FullName)" -ForegroundColor Green
                   $content = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
                   
-                  # 将底层硬编码的 simsun.ttc 优先替换为读取同级目录下的 AdobeSongStd-Light.otf
-                  $patched = $content -replace '"simsun\.ttc"', '(GetFileAttributesA("AdobeSongStd-Light.otf") != (DWORD)-1 ? "AdobeSongStd-Light.otf" : "simsun.ttc")'
+                  # 级联检测：SongStd-Light.otf -> AdobeSongStd-Light.otf -> simsun.ttc
+                  $fallbackExpr = '(GetFileAttributesA("SongStd-Light.otf") != (DWORD)-1 ? "SongStd-Light.otf" : (GetFileAttributesA("AdobeSongStd-Light.otf") != (DWORD)-1 ? "AdobeSongStd-Light.otf" : "simsun.ttc"))'
+                  $patched = $content -replace '"simsun\.ttc"', $fallbackExpr
                   [System.IO.File]::WriteAllText($file.FullName, $patched, [System.Text.Encoding]::UTF8)
               }
               Write-Host "补丁注入成功！" -ForegroundColor Green
@@ -41,12 +42,12 @@ jobs:
       - name: 4. 执行多线程编译 (Release x64)
         run: |
           if (Test-Path "vs2022/SumatraPDF.sln") {
-              msbuild vs2022/SumatraPDF.sln /p:Configuration=Release /p:Platform=x64 /m
+              msbuild vs2022/SumatraPDF.sln /p:Configuration=Release /p:Platform=x64 /t:SumatraPDF /m
           } elseif (Test-Path "src/SumatraPDF.sln") {
-              msbuild src/SumatraPDF.sln /p:Configuration=Release /p:Platform=x64 /m
+              msbuild src/SumatraPDF.sln /p:Configuration=Release /p:Platform=x64 /t:SumatraPDF /m
           } else {
               $sln = Get-ChildItem -Filter *.sln -Recurse | Select-Object -First 1
-              msbuild $sln.FullName /p:Configuration=Release /p:Platform=x64 /m
+              msbuild $sln.FullName /p:Configuration=Release /p:Platform=x64 /t:SumatraPDF /m
           }
 
       - name: 5. 提取并打包生成物
