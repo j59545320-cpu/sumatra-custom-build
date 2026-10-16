@@ -52,14 +52,8 @@ jobs:
         run: |
           msbuild vs2022\SumatraPDF.sln /p:Configuration=Release /p:Platform=x64 /t:SumatraPDF /m
 
-      - name: 5. 提取打包生成物
-        shell: cmd
-        run: |
-          mkdir output
-          for /r %%i in (SumatraPDF.exe) do copy "%%i" output\
-
-      - name: 6. 上传产物
+      - name: 5. 自动搜索并上传产物
         uses: actions/upload-artifact@v4
         with:
           name: SumatraPDF-SongStd-x64
-          path: ./output/SumatraPDF.exe
+          path: '**/*SumatraPDF*.exe'
