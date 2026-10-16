@@ -62,7 +62,17 @@ jobs:
       - name: 5. 提取打包生成物
         shell: pwsh
         run: |
-          $exePath = (Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse \vert{} Where-Object { $_.FullName -match "Release" } | Select-Object -First 1).FullName;
+          $files = Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse;
+          $exePath = "";
+          foreach ($f in$files) {
+              if ($f.FullName -match "Release") {
+                  $exePath =$f.FullName;
+                  break;
+              }
+          }
+          if ($exePath -eq "") {
+              $exePath =$files[0].FullName;
+          }
           New-Item -ItemType Directory -Path ./output -Force;
           Copy-Item -Path $exePath -Destination ./output/SumatraPDF.exe;
 
