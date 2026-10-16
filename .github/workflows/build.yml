@@ -21,35 +21,28 @@ jobs:
       - name: 2. 顶层私有字体注册 & 底层无损替换
         shell: pwsh
         run: |
-          $mupdfFiles = Get-ChildItem -Path "ext/mupdf/source" -Recurse -Filter "*.c";
+          $mupdfFiles = Get-ChildItem -Path "ext/mupdf/source" -Recurse -Filter "*.c"
           foreach ($f in $mupdfFiles) {
-              $txt = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8);
+              $txt = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
               if ($txt -match '(?i)"simsun\.ttc"') {
-                  $txt = $txt -replace '(?i)"simsun\.ttc"', '"SongStd-Light.otf"';
-                  [System.IO.File]::WriteAllText($f.FullName, $txt, [System.Text.Encoding]::UTF8);
-                  Write-Host "已修改底层回退请求: $($f.Name)" -ForegroundColor Cyan;
+                  $txt = $txt -replace '(?i)"simsun\.ttc"', '"SongStd-Light.otf"'
+                  [System.IO.File]::WriteAllText($f.FullName, $txt, [System.Text.Encoding]::UTF8)
               }
           }
 
-          $srcFiles = Get-ChildItem -Path "src" -Recurse -Filter "*.cpp";
-          $injected = $false;
+          $srcFiles = Get-ChildItem -Path "src" -Recurse -Filter "*.cpp"
+          $injected = $false
           foreach ($f in $srcFiles) {
-              $txt = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8);
-              
+              $txt = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
               if ($txt -match 'APIENTRY\s+w?WinMain') {
-                  Write-Host "成功锁定程序主入口: $($f.Name)" -ForegroundColor Green;
                   $hook = "`r`n    // === 注入：进程私有字体挂载 ===`r`n    AddFontResourceExW(L`"SongStd-Light.otf`", FR_PRIVATE, 0);`r`n    AddFontResourceExW(L`"AdobeSongStd-Light.otf`", FR_PRIVATE, 0);`r`n"
-                  $txt = [regex]::Replace($txt, '(?s)(APIENTRY\s+w?WinMain\s*\([^)]*\)\s*\{)', "`$1$hook", 1);
-                  [System.IO.File]::WriteAllText($f.FullName, $txt, [System.Text.Encoding]::UTF8);
-                  $injected =$true;
-                  break;
+                  $txt = [regex]::Replace($txt, '(?s)(APIENTRY\s+w?WinMain\s*\([^)]*\)\s*\{)', "`$1$hook", 1)
+                  [System.IO.File]::WriteAllText($f.FullName, $txt, [System.Text.Encoding]::UTF8)
+                  $injected =$true
+                  break
               }
           }
-
-          if (-not $injected) {
-              Write-Error "未能找到 wWinMain 注入点，终止编译！";
-              exit 1;
-          }
+          if (-not $injected) { exit 1 }
 
       - name: 3. 配置 MSBuild 环境
         uses: microsoft/setup-msbuild@v2
@@ -60,21 +53,10 @@ jobs:
           msbuild vs2022\SumatraPDF.sln /p:Configuration=Release /p:Platform=x64 /t:SumatraPDF /m
 
       - name: 5. 提取打包生成物
-        shell: pwsh
+        shell: cmd
         run: |
-          $files = Get-ChildItem -Path . -Filter "SumatraPDF.exe" -Recurse;
-          $exePath = "";
-          foreach ($f in$files) {
-              if ($f.FullName -match "Release") {
-                  $exePath =$f.FullName;
-                  break;
-              }
-          }
-          if ($exePath -eq "") {
-              $exePath =$files[0].FullName;
-          }
-          New-Item -ItemType Directory -Path ./output -Force;
-          Copy-Item -Path $exePath -Destination ./output/SumatraPDF.exe;
+          mkdir output
+          for /r %%i in (SumatraPDF.exe) do copy "%%i" output\
 
       - name: 6. 上传产物
         uses: actions/upload-artifact@v4
