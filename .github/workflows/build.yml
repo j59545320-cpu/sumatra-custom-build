@@ -18,40 +18,42 @@ jobs:
           git config --global core.longpaths true
           git clone --recurse-submodules --depth 1 https://github.com/sumatrapdfreader/sumatrapdf.git .
 
-      - name: 2. 精准注入无损字体分流逻辑
+      - name: 2. 顶层私有字体注册 & 底层无损替换
         shell: pwsh
         run: |
-          $targetFiles = Get-ChildItem -Path "ext/mupdf/source" -Recurse -Filter "*.c";
-          $patchedCount = 0;
-
-          $b64Hook = "CiAgICBjaGFyIF9sb2NhbFBhdGhbNTEyXSA9IHswfTsKICAgIGlmIChwYXRoICYmIChzdHJzdHIocGF0aCwgIlNvbmdTdGQtTGlnaHQub3RmIikgfHwgaW5kZXggPT0gMCkpIHsKICAgICAgICBpZiAoR2V0RmlsZUF0dHJpYnV0ZXNBKHBhdGgpID09IChEV09SRCktMSkgewogICAgICAgICAgICBpZiAoR2V0TW9kdWxlRmlsZU5hbWVhKE5VTEwsIF9sb2NhbFBhdGgsIDUwMCkpIHsKICAgICAgICAgICAgICAgIGNoYXIgKl9wID0gc3RycmNocihfbG9jYWxQYXRoLCAnXFwnKTsKICAgICAgICAgICAgICAgIGlmIChfcCkgewogICAgICAgICAgICAgICAgICAgICooX3AgKyAxKSA9ICdcMCc7CiAgICAgICAgICAgICAgICAgICAgc3RyY2F0KF9sb2NhbFBhdGgsICJTb25nU3RkLUxpZ2h0Lm90ZiIpOwogICAgICAgICAgICAgICAgICAgIGlmIChHZXRGaWxlQXR0cmlidXRlc0EoX2xvY2FsUGF0aCkgIT0gKERXT1JEKS0xKSB7CiAgICAgICAgICAgICAgICAgICAgICAgIHBhdGggPSBfbG9jYWxQYXRoOwogICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgfQogICAgICAgIH0KICAgIH0K";
-          $hookCode = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($b64Hook)).Replace("GetModuleFileNamea", "GetModuleFileNameA");
-
-          foreach ($f in $targetFiles) {
+          # 步骤 A：在底层 MuPDF 中，仅替换回退请求名称，不添加任何 Windows API，避免 C2065 报错
+          $mupdfFiles = Get-ChildItem -Path "ext/mupdf/source" -Recurse -Filter "*.c";
+          foreach ($f in $mupdfFiles) {
               $txt = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8);
-              $modified = $false;
-
               if ($txt -match '(?i)"simsun\.ttc"') {
-                  Write-Host "在 $($f.Name) 中定位到 simsun.ttc，执行替换..." -ForegroundColor Cyan;
                   $txt = $txt -replace '(?i)"simsun\.ttc"', '"SongStd-Light.otf"';
-                  $modified = $true;
-                  $patchedCount++;
-              }
-
-              if ($f.Name -eq "font.c" -and $txt -match 'fz_new_font_from_file\s*\([^)]+\)\s*\{') {
-                  Write-Host "在 font.c 注入本地同级目录智能兜底..." -ForegroundColor Green;
-                  $txt = [regex]::Replace($txt, '(?s)(fz_new_font_from_file\s*\([^)]+\)\s*\{)', "`$1`r`n$hookCode", 1);
-                  $modified =$true;
-                  $patchedCount++;
-              }
-
-              if ($modified) {
                   [System.IO.File]::WriteAllText($f.FullName, $txt, [System.Text.Encoding]::UTF8);
+                  Write-Host "已修改底层回退请求: $($f.Name)" -ForegroundColor Cyan;
               }
           }
 
-          if ($patchedCount -eq 0) {
-              Write-Error "未命中目标代码，停止编译！";
+          # 步骤 B：在顶层外壳（C++层，天生支持 windows.h）寻找程序启动总入口 WinMain
+          $srcFiles = Get-ChildItem -Path "src" -Recurse -Filter "*.cpp";
+          $injected = $false;
+          foreach ($f in $srcFiles) {
+              $txt = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8);
+              
+              # 匹配 Windows 程序入口点 APIENTRY wWinMain
+              if ($txt -match 'APIENTRY\s+w?WinMain') {
+                  Write-Host "成功锁定程序主入口: $($f.Name)" -ForegroundColor Green;
+                  
+                  # 注入神级 API：将当前 EXE 所在目录下的 otf 临时注册进当前进程系统字库 (FR_PRIVATE)
+                  $hook = "`r`n    // === 注入：进程私有字体挂载 ===`r`n    AddFontResourceExW(L`"SongStd-Light.otf`", FR_PRIVATE, 0);`r`n    AddFontResourceExW(L`"AdobeSongStd-Light.otf`", FR_PRIVATE, 0);`r`n"
+                  
+                  $txt = [regex]::Replace($txt, '(?s)(APIENTRY\s+w?WinMain\s*\([^)]*\)\s*\{)', "`$1$hook", 1);
+                  [System.IO.File]::WriteAllText($f.FullName, $txt, [System.Text.Encoding]::UTF8);
+                  $injected =$true;
+                  break;
+              }
+          }
+
+          if (-not $injected) {
+              Write-Error "未能找到 wWinMain 注入点，终止编译！";
               exit 1;
           }
 
