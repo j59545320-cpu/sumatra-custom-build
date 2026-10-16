@@ -21,7 +21,6 @@ jobs:
       - name: 2. 顶层私有字体注册 & 底层无损替换
         shell: pwsh
         run: |
-          # 步骤 A：在底层 MuPDF 中，仅替换回退请求名称，不添加任何 Windows API，避免 C2065 报错
           $mupdfFiles = Get-ChildItem -Path "ext/mupdf/source" -Recurse -Filter "*.c";
           foreach ($f in $mupdfFiles) {
               $txt = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8);
@@ -32,19 +31,14 @@ jobs:
               }
           }
 
-          # 步骤 B：在顶层外壳（C++层，天生支持 windows.h）寻找程序启动总入口 WinMain
           $srcFiles = Get-ChildItem -Path "src" -Recurse -Filter "*.cpp";
           $injected = $false;
           foreach ($f in $srcFiles) {
               $txt = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8);
               
-              # 匹配 Windows 程序入口点 APIENTRY wWinMain
               if ($txt -match 'APIENTRY\s+w?WinMain') {
                   Write-Host "成功锁定程序主入口: $($f.Name)" -ForegroundColor Green;
-                  
-                  # 注入神级 API：将当前 EXE 所在目录下的 otf 临时注册进当前进程系统字库 (FR_PRIVATE)
                   $hook = "`r`n    // === 注入：进程私有字体挂载 ===`r`n    AddFontResourceExW(L`"SongStd-Light.otf`", FR_PRIVATE, 0);`r`n    AddFontResourceExW(L`"AdobeSongStd-Light.otf`", FR_PRIVATE, 0);`r`n"
-                  
                   $txt = [regex]::Replace($txt, '(?s)(APIENTRY\s+w?WinMain\s*\([^)]*\)\s*\{)', "`$1$hook", 1);
                   [System.IO.File]::WriteAllText($f.FullName, $txt, [System.Text.Encoding]::UTF8);
                   $injected =$true;
