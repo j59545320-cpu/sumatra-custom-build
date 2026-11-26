@@ -178,7 +178,7 @@ static bool PrinterSupports600Dpi(const wchar_t* printerName) {
     return false;
 }
 
-// 构建兼容本地与企业共享打印机的 Printer DC（带 600 DPI 优先与两级自动降级）
+// 构建兼容本地与企业共享打印机的 Printer DC（优先 600 DPI + 两级降级）
 static HDC CreatePrinterDCWithDuplex(const std::wstring& printerName, short duplexMode,
                                      std::vector<BYTE>& outDmBuf) {
     std::vector<wchar_t> printerBuf(printerName.begin(), printerName.end());
@@ -213,7 +213,6 @@ static HDC CreatePrinterDCWithDuplex(const std::wstring& printerName, short dupl
         ClosePrinter(hPrinter);
     }
 
-    // 兜底：纯标准 DEVMODEW
     outDmBuf.assign(sizeof(DEVMODEW), 0);
     DEVMODEW* stdDm = reinterpret_cast<DEVMODEW*>(outDmBuf.data());
     stdDm->dmSize = sizeof(DEVMODEW);
@@ -227,6 +226,64 @@ static HDC CreatePrinterDCWithDuplex(const std::wstring& printerName, short dupl
         stdDm->dmYResolution  = 600;
     }
     return CreateDCW(L"WINSPOOL", printerBuf.data(), nullptr, stdDm);
+}
+
+// 整页统一 1:1 分带光栅化 + 深黑笔画压实（消除水印区局部发飘，保留浅灰水印与彩色印章）
+static void RenderPageUniformBanded(HDC hdc, FPDF_PAGE page,
+                                    int offsetX, int offsetY,
+                                    int sizeX, int sizeY) {
+    int horzRes = GetDeviceCaps(hdc, HORZRES);
+    int vertRes = GetDeviceCaps(hdc, VERTRES);
+    if (horzRes <= 0 || vertRes <= 0) {
+        FPDF_RenderPage(hdc, page, -offsetX, -offsetY, sizeX, sizeY, 0,
+                        FPDF_PRINTING | FPDF_ANNOT);
+        return;
+    }
+
+    const int bandHeight = 1024; // 每带 1024 像素高，600 DPI 下仅占约 20 MB 内存
+    for (int bandY = 0; bandY < vertRes; bandY += bandHeight) {
+        int curH = std::min(bandHeight, vertRes - bandY);
+        FPDF_BITMAP bmp = FPDFBitmap_Create(horzRes, curH, 0); // BGRx 32位
+        if (!bmp) {
+            FPDF_RenderPage(hdc, page, -offsetX, -offsetY, sizeX, sizeY, 0,
+                            FPDF_PRINTING | FPDF_ANNOT);
+            return;
+        }
+
+        FPDFBitmap_FillRect(bmp, 0, 0, horzRes, curH, 0xFFFFFFFF);
+        FPDF_RenderPageBitmap(bmp, page, -offsetX, -offsetY - bandY, sizeX, sizeY, 0,
+                              FPDF_PRINTING | FPDF_ANNOT);
+
+        // 将深灰文字与抗锯齿暗边压实为纯黑 (0,0,0)，浅灰水印(>150)和红章(R通道高)毫发无损
+        unsigned char* buf = static_cast<unsigned char*>(FPDFBitmap_GetBuffer(bmp));
+        int stride = FPDFBitmap_GetStride(bmp);
+        for (int y = 0; y < curH; ++y) {
+            unsigned char* row = buf + y * stride;
+            for (int x = 0; x < horzRes; ++x) {
+                unsigned char* px = row + x * 4;
+                if (px[0] < 96 && px[1] < 96 && px[2] < 96) {
+                    px[0] = 0;
+                    px[1] = 0;
+                    px[2] = 0;
+                }
+            }
+        }
+
+        BITMAPINFO bmi = {};
+        bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth       = horzRes;
+        bmi.bmiHeader.biHeight      = -curH;
+        bmi.bmiHeader.biPlanes      = 1;
+        bmi.bmiHeader.biBitCount    = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+
+        StretchDIBits(hdc,
+                      0, bandY, horzRes, curH,
+                      0, 0, horzRes, curH,
+                      buf, &bmi, DIB_RGB_COLORS, SRCCOPY);
+
+        FPDFBitmap_Destroy(bmp);
+    }
 }
 
 // ---------------- 主入口：兼容 SumatraPDF 命令行参数 ----------------
@@ -372,15 +429,14 @@ int wmain(int argc, wchar_t* argv[]) {
         int offsetY = GetDeviceCaps(hdc, PHYSICALOFFSETY);
 
         if (i == 0) {
-            wprintf(L"[Render] Printer DPI: %dx%d | Mode: Default EMF\n", dpiX, dpiY);
+            wprintf(L"[Render] Printer DPI: %dx%d | Mode: Uniform 1:1 Banded + PureBlack\n", dpiX, dpiY);
         }
 
         int sizeX = (int)std::lround(pageW_pt * dpiX / 72.0);
         int sizeY = (int)std::lround(pageH_pt * dpiY / 72.0);
 
         if (StartPage(hdc) > 0) {
-            FPDF_RenderPage(hdc, page, -offsetX, -offsetY, sizeX, sizeY, 0,
-                            FPDF_PRINTING | FPDF_ANNOT);
+            RenderPageUniformBanded(hdc, page, offsetX, offsetY, sizeX, sizeY);
             EndPage(hdc);
         }
         FPDF_ClosePage(page);
