@@ -37,7 +37,6 @@ static std::wstring GetExeDir() {
     return (pos == std::wstring::npos) ? L"." : p.substr(0, pos);
 }
 
-// 免管理员权限加载同级目录下的 SongStd-Light.otf，并解析 Windows GDI 真实字体族名
 static void LoadLocalSongFont() {
     std::wstring dir = GetExeDir();
     const wchar_t* candidates[] = {
@@ -53,7 +52,6 @@ static void LoadLocalSongFont() {
         if (AddFontResourceExW(fullPath.c_str(), FR_PRIVATE, 0) > 0) {
             g_loadedFontPath = fullPath;
 
-            // 通过 gdi32 获取该 OTF 文件注册进当前进程后的准确 GDI FaceName
             HMODULE hGdi = GetModuleHandleW(L"gdi32.dll");
             auto pGetInfo = hGdi ? (PFN_GetFontResourceInfoW)GetProcAddress(hGdi, "GetFontResourceInfoW") : nullptr;
             if (pGetInfo) {
@@ -73,7 +71,6 @@ static void LoadLocalSongFont() {
     }
 }
 
-// 必须透传 g_origFontInfo 作为第一个参数，防止 PDFium 内部扩展结构体偏移错位
 static void HookRelease(FPDF_SYSFONTINFO*) {}
 
 static void HookEnumFonts(FPDF_SYSFONTINFO*, void* pMapper) {
@@ -169,7 +166,7 @@ static std::wstring ToLowerW(std::wstring s) {
 int wmain(int argc, wchar_t* argv[]) {
     std::wstring printerName;
     std::wstring pdfPath;
-    short duplexMode = 0; // 0=不改动驱动默认, DMDUP_SIMPLEX / DMDUP_VERTICAL / DMDUP_HORIZONTAL
+    short duplexMode = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::wstring arg = argv[i];
@@ -207,13 +204,11 @@ int wmain(int argc, wchar_t* argv[]) {
         return 2;
     }
 
-    // 1. 先向当前进程私有挂载本地 SongStd-Light.otf，再初始化 PDFium
     LoadLocalSongFont();
 
     FPDF_LIBRARY_CONFIG config = {};
     config.version = 2;
     FPDF_InitLibraryWithConfig(&config);
-    FPDF_SetPrintMode(FPDF_PRINTMODE_EMF);
 
     g_origFontInfo = FPDF_GetDefaultSystemFontInfo();
     if (g_origFontInfo) {
@@ -229,7 +224,6 @@ int wmain(int argc, wchar_t* argv[]) {
         FPDF_SetSystemFontInfo(&g_hookFontInfo);
     }
 
-    // 2. 用原生 Unicode API 读入内存（彻底规避中文路径 / 长路径问题）
     std::vector<unsigned char> pdfBytes;
     if (!ReadWholeFile(pdfPath, pdfBytes)) {
         fwprintf(stderr, L"[ERROR] Cannot read PDF: %ls\n", pdfPath.c_str());
@@ -241,7 +235,6 @@ int wmain(int argc, wchar_t* argv[]) {
         return 4;
     }
 
-    // 3. 标准 Win32 DEVMODE 协商（与 SumatraPDF 底层同构，防驱动忽略双面）
     HANDLE hPrinter = nullptr;
     std::vector<wchar_t> printerBuf(printerName.begin(), printerName.end());
     printerBuf.push_back(L'\0');
@@ -267,7 +260,6 @@ int wmain(int argc, wchar_t* argv[]) {
         dm->dmFields |= DM_DUPLEX;
         dm->dmDuplex = duplexMode;
     }
-    // 关键：将修改后的 DEVMODE 交回打印机驱动做合并校验
     DocumentPropertiesW(nullptr, hPrinter, printerBuf.data(), dm, dm, DM_IN_BUFFER | DM_OUT_BUFFER);
 
     HDC hdc = CreateDCW(L"WINSPOOL", printerBuf.data(), nullptr, dm);
@@ -278,7 +270,6 @@ int wmain(int argc, wchar_t* argv[]) {
         return 7;
     }
 
-    // 提取纯文件名作为打印队列任务名
     size_t slash = pdfPath.find_last_of(L"\\/");
     std::wstring docTitle = (slash == std::wstring::npos) ? pdfPath : pdfPath.substr(slash + 1);
 
@@ -304,7 +295,6 @@ int wmain(int argc, wchar_t* argv[]) {
         double pageW_pt = FPDF_GetPageWidth(page);
         double pageH_pt = FPDF_GetPageHeight(page);
 
-        // 按当前页自动对齐横/竖纸向
         bool pageLandscape = (pageW_pt > pageH_pt);
         bool dcLandscape = (GetDeviceCaps(hdc, PHYSICALWIDTH) > GetDeviceCaps(hdc, PHYSICALHEIGHT));
         if (pageLandscape != dcLandscape) {
@@ -318,7 +308,6 @@ int wmain(int argc, wchar_t* argv[]) {
         int offsetX = GetDeviceCaps(hdc, PHYSICALOFFSETX);
         int offsetY = GetDeviceCaps(hdc, PHYSICALOFFSETY);
 
-        // 1:1 真实物理尺寸（noscale），并反向抵消打印机硬件不可打印边距
         int sizeX = (int)std::lround(pageW_pt * dpiX / 72.0);
         int sizeY = (int)std::lround(pageH_pt * dpiY / 72.0);
 
