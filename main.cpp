@@ -13,17 +13,6 @@
 #include "fpdfview.h"
 #include "fpdf_sysfontinfo.h"
 
-// PDFium 矢量打印模式与关闭灰度抗锯齿标志（对齐 Edge 锐利边缘）
-#ifndef FPDF_PRINTMODE_EMF_IMAGE_MASKS
-#define FPDF_PRINTMODE_EMF_IMAGE_MASKS 6
-#endif
-#ifndef FPDF_RENDER_NO_SMOOTHTEXT
-#define FPDF_RENDER_NO_SMOOTHTEXT 0x1000
-#endif
-#ifndef FPDF_RENDER_NO_SMOOTHPATH
-#define FPDF_RENDER_NO_SMOOTHPATH 0x4000
-#endif
-
 // ---------------- 本地私有字体加载与 PDFium 字体映射钩子 ----------------
 typedef BOOL(WINAPI* PFN_GetFontResourceInfoW)(LPCWSTR, LPDWORD, LPVOID, DWORD);
 
@@ -174,11 +163,28 @@ static std::wstring ToLowerW(std::wstring s) {
     return s;
 }
 
-// 构建兼容本地与企业共享打印机的 Printer DC（带两级自动降级）
+// 查询打印机驱动是否支持 600x600 DPI
+static bool PrinterSupports600Dpi(const wchar_t* printerName) {
+    int count = (int)DeviceCapabilitiesW(printerName, nullptr, DC_ENUMRESOLUTIONS, nullptr, nullptr);
+    if (count <= 0 || count > 1024) return false;
+    std::vector<LONG> res((size_t)count * 2, 0);
+    if ((int)DeviceCapabilitiesW(printerName, nullptr, DC_ENUMRESOLUTIONS,
+                                 reinterpret_cast<LPWSTR>(res.data()), nullptr) <= 0) {
+        return false;
+    }
+    for (int i = 0; i < count; ++i) {
+        if (res[i * 2] == 600 && res[i * 2 + 1] == 600) return true;
+    }
+    return false;
+}
+
+// 构建兼容本地与企业共享打印机的 Printer DC（带 600 DPI 优先与两级自动降级）
 static HDC CreatePrinterDCWithDuplex(const std::wstring& printerName, short duplexMode,
                                      std::vector<BYTE>& outDmBuf) {
     std::vector<wchar_t> printerBuf(printerName.begin(), printerName.end());
     printerBuf.push_back(L'\0');
+
+    bool want600 = PrinterSupports600Dpi(printerBuf.data());
 
     HANDLE hPrinter = nullptr;
     if (OpenPrinterW(printerBuf.data(), &hPrinter, nullptr)) {
@@ -191,6 +197,11 @@ static HDC CreatePrinterDCWithDuplex(const std::wstring& printerName, short dupl
                     dm->dmFields |= DM_DUPLEX;
                     dm->dmDuplex = duplexMode;
                 }
+                if (want600) {
+                    dm->dmFields |= DM_PRINTQUALITY | DM_YRESOLUTION;
+                    dm->dmPrintQuality = 600;
+                    dm->dmYResolution  = 600;
+                }
                 DocumentPropertiesW(nullptr, hPrinter, printerBuf.data(), dm, dm, DM_IN_BUFFER | DM_OUT_BUFFER);
                 HDC hdc = CreateDCW(L"WINSPOOL", printerBuf.data(), nullptr, dm);
                 if (hdc) {
@@ -202,13 +213,18 @@ static HDC CreatePrinterDCWithDuplex(const std::wstring& printerName, short dupl
         ClosePrinter(hPrinter);
     }
 
-    // 兜底：纯标准 DEVMODEW（规避企业共享打印机驱动私有数据校验拒绝）
+    // 兜底：纯标准 DEVMODEW
     outDmBuf.assign(sizeof(DEVMODEW), 0);
     DEVMODEW* stdDm = reinterpret_cast<DEVMODEW*>(outDmBuf.data());
     stdDm->dmSize = sizeof(DEVMODEW);
     if (duplexMode != 0) {
-        stdDm->dmFields = DM_DUPLEX;
+        stdDm->dmFields |= DM_DUPLEX;
         stdDm->dmDuplex = duplexMode;
+    }
+    if (want600) {
+        stdDm->dmFields |= DM_PRINTQUALITY | DM_YRESOLUTION;
+        stdDm->dmPrintQuality = 600;
+        stdDm->dmYResolution  = 600;
     }
     return CreateDCW(L"WINSPOOL", printerBuf.data(), nullptr, stdDm);
 }
@@ -262,7 +278,6 @@ int wmain(int argc, wchar_t* argv[]) {
     FPDF_LIBRARY_CONFIG config = {};
     config.version = 2;
     FPDF_InitLibraryWithConfig(&config);
-    FPDF_BOOL modeOk = FPDF_SetPrintMode(FPDF_PRINTMODE_EMF_IMAGE_MASKS);
 
     g_origFontInfo = FPDF_GetDefaultSystemFontInfo();
     if (g_origFontInfo) {
@@ -357,8 +372,7 @@ int wmain(int argc, wchar_t* argv[]) {
         int offsetY = GetDeviceCaps(hdc, PHYSICALOFFSETY);
 
         if (i == 0) {
-            wprintf(L"[Render] Printer DPI: %dx%d | Mode: EMF_IMAGE_MASKS(6) | SetModeOK: %d\n",
-                    dpiX, dpiY, (int)modeOk);
+            wprintf(L"[Render] Printer DPI: %dx%d | Mode: Default EMF\n", dpiX, dpiY);
         }
 
         int sizeX = (int)std::lround(pageW_pt * dpiX / 72.0);
@@ -366,7 +380,7 @@ int wmain(int argc, wchar_t* argv[]) {
 
         if (StartPage(hdc) > 0) {
             FPDF_RenderPage(hdc, page, -offsetX, -offsetY, sizeX, sizeY, 0,
-                            FPDF_PRINTING | FPDF_ANNOT | FPDF_RENDER_NO_SMOOTHTEXT | FPDF_RENDER_NO_SMOOTHPATH);
+                            FPDF_PRINTING | FPDF_ANNOT);
             EndPage(hdc);
         }
         FPDF_ClosePage(page);
