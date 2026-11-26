@@ -16,7 +16,6 @@
 // 启用 Edge 同款 EMF 矢量打印模式（解决文字边缘锯齿，对齐 Edge 锐利度）
 #ifndef FPDF_PRINTMODE_EMF
 #define FPDF_PRINTMODE_EMF 0
-extern "C" FPDF_EXPORT void FPDF_CALLCONV FPDF_SetPrintMode(int mode);
 #endif
 
 // ---------------- 本地私有字体加载与 PDFium 字体映射钩子 ----------------
