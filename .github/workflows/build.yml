@@ -1,59 +1,41 @@
-name: Build Custom SumatraPDF
+name: Build PdfiumPrint (Win32 x86)
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - '.github/workflows/build.yml'
   workflow_dispatch:
+  push:
+    paths:
+      - 'main.cpp'
+      - '.github/workflows/build.yml'
 
 jobs:
   build:
     runs-on: windows-2022
 
     steps:
-      - name: 1. 拉取源码
-        run: |
-          git config --global core.longpaths true
-          git clone --recurse-submodules --depth 1 https://github.com/sumatrapdfreader/sumatrapdf.git .
+      - name: 1. 检出源码
+        uses: actions/checkout@v4
 
-      - name: 2. 顶层私有字体注册 & 底层无损替换
+      - name: 2. 下载开源预编译 PDFium (Win32 x86，兼容32/64位系统)
         shell: pwsh
         run: |
-          $mupdfFiles = Get-ChildItem -Path "ext/mupdf/source" -Recurse -Filter "*.c"
-          foreach ($f in $mupdfFiles) {
-              $txt = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
-              if ($txt -match '(?i)"simsun\.ttc"') {
-                  $txt = $txt -replace '(?i)"simsun\.ttc"', '"SongStd-Light.otf"'
-                  [System.IO.File]::WriteAllText($f.FullName, $txt, [System.Text.Encoding]::UTF8)
-              }
-          }
+          New-Item -ItemType Directory -Path pdfium -Force | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-win-x86.tgz" -OutFile "pdfium.tgz"
+          tar -xzf pdfium.tgz -C pdfium
 
-          $srcFiles = Get-ChildItem -Path "src" -Recurse -Filter "*.cpp"
-          $injected = $false
-          foreach ($f in $srcFiles) {
-              $txt = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
-              if ($txt -match 'APIENTRY\s+w?WinMain') {
-                  $hook = "`r`n    // === 注入：进程私有字体挂载 ===`r`n    AddFontResourceExW(L`"SongStd-Light.otf`", FR_PRIVATE, 0);`r`n    AddFontResourceExW(L`"AdobeSongStd-Light.otf`", FR_PRIVATE, 0);`r`n"
-                  $txt = [regex]::Replace($txt, '(?s)(APIENTRY\s+w?WinMain\s*\([^)]*\)\s*\{)', "`$1$hook", 1)
-                  [System.IO.File]::WriteAllText($f.FullName, $txt, [System.Text.Encoding]::UTF8)
-                  $injected =$true
-                  break
-              }
-          }
-          if (-not $injected) { exit 1 }
+      - name: 3. 初始化 MSVC x86 编译环境
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
 
-      - name: 3. 配置 MSBuild 环境
-        uses: microsoft/setup-msbuild@v2
-
-      - name: 4. 执行 Release x64 编译
+      - name: 4. 静态编译 PdfiumPrint.exe (零 VC++ 运行库依赖)
         shell: cmd
         run: |
-          msbuild vs2022\SumatraPDF.sln /p:Configuration=Release /p:Platform=x64 /t:SumatraPDF /m
+          mkdir output
+          cl.exe /nologo /O2 /EHsc /MT /W3 /I pdfium\include main.cpp /link /LIBPATH:pdfium\lib pdfium.dll.lib winspool.lib gdi32.lib user32.lib /OUT:output\PdfiumPrint.exe
+          copy /Y pdfium\bin\pdfium.dll output\pdfium.dll
 
-      - name: 5. 自动搜索并上传产物
+      - name: 5. 打包上传成品
         uses: actions/upload-artifact@v4
         with:
-          name: SumatraPDF-SongStd-x64
-          path: '**/*SumatraPDF*.exe'
+          name: PdfiumPrint-Win32-Portable
+          path: output/
