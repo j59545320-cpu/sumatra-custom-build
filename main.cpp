@@ -13,6 +13,10 @@
 #include "fpdfview.h"
 #include "fpdf_sysfontinfo.h"
 
+#ifndef FPDFBitmap_Gray
+#define FPDFBitmap_Gray 1
+#endif
+
 // ---------------- 本地私有字体加载与 PDFium 字体映射钩子 ----------------
 typedef BOOL(WINAPI* PFN_GetFontResourceInfoW)(LPCWSTR, LPDWORD, LPVOID, DWORD);
 
@@ -228,10 +232,15 @@ static HDC CreatePrinterDCWithDuplex(const std::wstring& printerName, short dupl
     return CreateDCW(L"WINSPOOL", printerBuf.data(), nullptr, stdDm);
 }
 
-// 整页统一 1:1 分带光栅化 + 深黑笔画压实（消除水印区局部发飘，保留浅灰水印与彩色印章）
-static void RenderPageUniformBanded(HDC hdc, FPDF_PAGE page,
-                                    int offsetX, int offsetY,
-                                    int sizeX, int sizeY) {
+struct GrayBitmapInfo {
+    BITMAPINFOHEADER bmiHeader;
+    RGBQUAD bmiColors[256];
+};
+
+// 8 位纯灰度高速单次渲染 + 深黑笔画压实（数据量缩小 4 倍，消除 7 次分带重绘）
+static void RenderPageFastGray(HDC hdc, FPDF_PAGE page,
+                               int offsetX, int offsetY,
+                               int sizeX, int sizeY) {
     int horzRes = GetDeviceCaps(hdc, HORZRES);
     int vertRes = GetDeviceCaps(hdc, VERTRES);
     if (horzRes <= 0 || vertRes <= 0) {
@@ -240,49 +249,57 @@ static void RenderPageUniformBanded(HDC hdc, FPDF_PAGE page,
         return;
     }
 
-    const int bandHeight = 1024; // 每带 1024 像素高，600 DPI 下仅占约 20 MB 内存
+    // Windows GDI 8位位图要求每行字节数 4 字节对齐
+    int stride = (horzRes + 3) & ~3;
+    // 默认单次整页渲染（600 DPI A4 仅占 ~34 MB）；超大纸张自动限制在 48 MB 以内分带
+    int maxBandRows = std::max(1024, (48 * 1024 * 1024) / stride);
+    int bandHeight = std::min(vertRes, maxBandRows);
+
+    std::vector<unsigned char> pixelBuf((size_t)stride * bandHeight);
+
+    GrayBitmapInfo bmi = {};
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = horzRes;
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 8;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    bmi.bmiHeader.biClrUsed     = 256;
+    for (int c = 0; c < 256; ++c) {
+        bmi.bmiColors[c].rgbRed   = (BYTE)c;
+        bmi.bmiColors[c].rgbGreen = (BYTE)c;
+        bmi.bmiColors[c].rgbBlue  = (BYTE)c;
+        bmi.bmiColors[c].rgbReserved = 0;
+    }
+
     for (int bandY = 0; bandY < vertRes; bandY += bandHeight) {
         int curH = std::min(bandHeight, vertRes - bandY);
-        FPDF_BITMAP bmp = FPDFBitmap_Create(horzRes, curH, 0); // BGRx 32位
+        std::memset(pixelBuf.data(), 0xFF, (size_t)stride * curH);
+
+        FPDF_BITMAP bmp = FPDFBitmap_CreateEx(horzRes, curH, FPDFBitmap_Gray, pixelBuf.data(), stride);
         if (!bmp) {
             FPDF_RenderPage(hdc, page, -offsetX, -offsetY, sizeX, sizeY, 0,
                             FPDF_PRINTING | FPDF_ANNOT);
             return;
         }
 
-        FPDFBitmap_FillRect(bmp, 0, 0, horzRes, curH, 0xFFFFFFFF);
         FPDF_RenderPageBitmap(bmp, page, -offsetX, -offsetY - bandY, sizeX, sizeY, 0,
-                              FPDF_PRINTING | FPDF_ANNOT);
+                              FPDF_PRINTING | FPDF_ANNOT | FPDF_GRAYSCALE);
+        FPDFBitmap_Destroy(bmp);
 
-        // 将深灰文字与抗锯齿暗边压实为纯黑 (0,0,0)，浅灰水印(>150)和红章(R通道高)毫发无损
-        unsigned char* buf = static_cast<unsigned char*>(FPDFBitmap_GetBuffer(bmp));
-        int stride = FPDFBitmap_GetStride(bmp);
+        // 将深灰文字边缘压实为纯黑 (0)，浅灰水印(>150)与红章灰度(>75)保持原样
         for (int y = 0; y < curH; ++y) {
-            unsigned char* row = buf + y * stride;
+            unsigned char* row = pixelBuf.data() + (size_t)y * stride;
             for (int x = 0; x < horzRes; ++x) {
-                unsigned char* px = row + x * 4;
-                if (px[0] < 96 && px[1] < 96 && px[2] < 96) {
-                    px[0] = 0;
-                    px[1] = 0;
-                    px[2] = 0;
-                }
+                if (row[x] < 72) row[x] = 0;
             }
         }
 
-        BITMAPINFO bmi = {};
-        bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth       = horzRes;
-        bmi.bmiHeader.biHeight      = -curH;
-        bmi.bmiHeader.biPlanes      = 1;
-        bmi.bmiHeader.biBitCount    = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-
+        bmi.bmiHeader.biHeight = -curH;
         StretchDIBits(hdc,
                       0, bandY, horzRes, curH,
                       0, 0, horzRes, curH,
-                      buf, &bmi, DIB_RGB_COLORS, SRCCOPY);
-
-        FPDFBitmap_Destroy(bmp);
+                      pixelBuf.data(), reinterpret_cast<BITMAPINFO*>(&bmi),
+                      DIB_RGB_COLORS, SRCCOPY);
     }
 }
 
@@ -429,14 +446,14 @@ int wmain(int argc, wchar_t* argv[]) {
         int offsetY = GetDeviceCaps(hdc, PHYSICALOFFSETY);
 
         if (i == 0) {
-            wprintf(L"[Render] Printer DPI: %dx%d | Mode: Uniform 1:1 Banded + PureBlack\n", dpiX, dpiY);
+            wprintf(L"[Render] Printer DPI: %dx%d | Mode: Fast 8-bit Grayscale Single-Pass\n", dpiX, dpiY);
         }
 
         int sizeX = (int)std::lround(pageW_pt * dpiX / 72.0);
         int sizeY = (int)std::lround(pageH_pt * dpiY / 72.0);
 
         if (StartPage(hdc) > 0) {
-            RenderPageUniformBanded(hdc, page, offsetX, offsetY, sizeX, sizeY);
+            RenderPageFastGray(hdc, page, offsetX, offsetY, sizeX, sizeY);
             EndPage(hdc);
         }
         FPDF_ClosePage(page);
