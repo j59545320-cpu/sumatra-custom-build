@@ -13,9 +13,15 @@
 #include "fpdfview.h"
 #include "fpdf_sysfontinfo.h"
 
-// 启用 Edge 同款 EMF 矢量打印模式（解决文字边缘锯齿，对齐 Edge 锐利度）
-#ifndef FPDF_PRINTMODE_EMF
-#define FPDF_PRINTMODE_EMF 0
+// PDFium 矢量打印模式与关闭灰度抗锯齿标志（对齐 Edge 锐利边缘）
+#ifndef FPDF_PRINTMODE_EMF_IMAGE_MASKS
+#define FPDF_PRINTMODE_EMF_IMAGE_MASKS 6
+#endif
+#ifndef FPDF_RENDER_NO_SMOOTHTEXT
+#define FPDF_RENDER_NO_SMOOTHTEXT 0x1000
+#endif
+#ifndef FPDF_RENDER_NO_SMOOTHPATH
+#define FPDF_RENDER_NO_SMOOTHPATH 0x4000
 #endif
 
 // ---------------- 本地私有字体加载与 PDFium 字体映射钩子 ----------------
@@ -256,7 +262,7 @@ int wmain(int argc, wchar_t* argv[]) {
     FPDF_LIBRARY_CONFIG config = {};
     config.version = 2;
     FPDF_InitLibraryWithConfig(&config);
-    FPDF_SetPrintMode(FPDF_PRINTMODE_EMF);
+    FPDF_BOOL modeOk = FPDF_SetPrintMode(FPDF_PRINTMODE_EMF_IMAGE_MASKS);
 
     g_origFontInfo = FPDF_GetDefaultSystemFontInfo();
     if (g_origFontInfo) {
@@ -350,12 +356,17 @@ int wmain(int argc, wchar_t* argv[]) {
         int offsetX = GetDeviceCaps(hdc, PHYSICALOFFSETX);
         int offsetY = GetDeviceCaps(hdc, PHYSICALOFFSETY);
 
+        if (i == 0) {
+            wprintf(L"[Render] Printer DPI: %dx%d | Mode: EMF_IMAGE_MASKS(6) | SetModeOK: %d\n",
+                    dpiX, dpiY, (int)modeOk);
+        }
+
         int sizeX = (int)std::lround(pageW_pt * dpiX / 72.0);
         int sizeY = (int)std::lround(pageH_pt * dpiY / 72.0);
 
         if (StartPage(hdc) > 0) {
             FPDF_RenderPage(hdc, page, -offsetX, -offsetY, sizeX, sizeY, 0,
-                            FPDF_PRINTING | FPDF_ANNOT);
+                            FPDF_PRINTING | FPDF_ANNOT | FPDF_RENDER_NO_SMOOTHTEXT | FPDF_RENDER_NO_SMOOTHPATH);
             EndPage(hdc);
         }
         FPDF_ClosePage(page);
