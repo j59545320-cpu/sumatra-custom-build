@@ -3,6 +3,7 @@
 #include <winspool.h>
 #include <algorithm>
 #include <cctype>
+#include <clocale>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -11,6 +12,12 @@
 
 #include "fpdfview.h"
 #include "fpdf_sysfontinfo.h"
+
+// 启用 Edge 同款 EMF 矢量打印模式（解决文字边缘锯齿，对齐 Edge 锐利度）
+#ifndef FPDF_PRINTMODE_EMF
+#define FPDF_PRINTMODE_EMF 0
+extern "C" FPDF_EXPORT void FPDF_CALLCONV FPDF_SetPrintMode(int mode);
+#endif
 
 // ---------------- 本地私有字体加载与 PDFium 字体映射钩子 ----------------
 typedef BOOL(WINAPI* PFN_GetFontResourceInfoW)(LPCWSTR, LPDWORD, LPVOID, DWORD);
@@ -124,7 +131,7 @@ static void HookDeleteFont(FPDF_SYSFONTINFO*, void* hFont) {
         g_origFontInfo->DeleteFont(g_origFontInfo, hFont);
 }
 
-// ---------------- 工具函数：Unicode 读文件 & 获取默认打印机 ----------------
+// ---------------- 工具函数 ----------------
 static bool ReadWholeFile(const std::wstring& path, std::vector<unsigned char>& out) {
     HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -162,8 +169,49 @@ static std::wstring ToLowerW(std::wstring s) {
     return s;
 }
 
-// ---------------- 主入口：100% 兼容 SumatraPDF 命令行参数 ----------------
+// 构建兼容本地与企业共享打印机的 Printer DC（带两级自动降级）
+static HDC CreatePrinterDCWithDuplex(const std::wstring& printerName, short duplexMode,
+                                     std::vector<BYTE>& outDmBuf) {
+    std::vector<wchar_t> printerBuf(printerName.begin(), printerName.end());
+    printerBuf.push_back(L'\0');
+
+    HANDLE hPrinter = nullptr;
+    if (OpenPrinterW(printerBuf.data(), &hPrinter, nullptr)) {
+        LONG dmSize = DocumentPropertiesW(nullptr, hPrinter, printerBuf.data(), nullptr, nullptr, 0);
+        if (dmSize > 0) {
+            outDmBuf.assign((size_t)dmSize, 0);
+            DEVMODEW* dm = reinterpret_cast<DEVMODEW*>(outDmBuf.data());
+            if (DocumentPropertiesW(nullptr, hPrinter, printerBuf.data(), dm, nullptr, DM_OUT_BUFFER) == IDOK) {
+                if (duplexMode != 0) {
+                    dm->dmFields |= DM_DUPLEX;
+                    dm->dmDuplex = duplexMode;
+                }
+                DocumentPropertiesW(nullptr, hPrinter, printerBuf.data(), dm, dm, DM_IN_BUFFER | DM_OUT_BUFFER);
+                HDC hdc = CreateDCW(L"WINSPOOL", printerBuf.data(), nullptr, dm);
+                if (hdc) {
+                    ClosePrinter(hPrinter);
+                    return hdc;
+                }
+            }
+        }
+        ClosePrinter(hPrinter);
+    }
+
+    // 兜底：纯标准 DEVMODEW（规避企业共享打印机驱动私有数据校验拒绝）
+    outDmBuf.assign(sizeof(DEVMODEW), 0);
+    DEVMODEW* stdDm = reinterpret_cast<DEVMODEW*>(outDmBuf.data());
+    stdDm->dmSize = sizeof(DEVMODEW);
+    if (duplexMode != 0) {
+        stdDm->dmFields = DM_DUPLEX;
+        stdDm->dmDuplex = duplexMode;
+    }
+    return CreateDCW(L"WINSPOOL", printerBuf.data(), nullptr, stdDm);
+}
+
+// ---------------- 主入口：兼容 SumatraPDF 命令行参数 ----------------
 int wmain(int argc, wchar_t* argv[]) {
+    setlocale(LC_ALL, "");
+
     std::wstring printerName;
     std::wstring pdfPath;
     short duplexMode = 0;
@@ -209,6 +257,7 @@ int wmain(int argc, wchar_t* argv[]) {
     FPDF_LIBRARY_CONFIG config = {};
     config.version = 2;
     FPDF_InitLibraryWithConfig(&config);
+    FPDF_SetPrintMode(FPDF_PRINTMODE_EMF);
 
     g_origFontInfo = FPDF_GetDefaultSystemFontInfo();
     if (g_origFontInfo) {
@@ -235,37 +284,10 @@ int wmain(int argc, wchar_t* argv[]) {
         return 4;
     }
 
-    HANDLE hPrinter = nullptr;
-    std::vector<wchar_t> printerBuf(printerName.begin(), printerName.end());
-    printerBuf.push_back(L'\0');
-
-    if (!OpenPrinterW(printerBuf.data(), &hPrinter, nullptr)) {
-        fwprintf(stderr, L"[ERROR] OpenPrinterW failed for: %ls\n", printerName.c_str());
-        FPDF_CloseDocument(doc);
-        return 5;
-    }
-
-    LONG dmSize = DocumentPropertiesW(nullptr, hPrinter, printerBuf.data(), nullptr, nullptr, 0);
-    if (dmSize <= 0) {
-        ClosePrinter(hPrinter);
-        FPDF_CloseDocument(doc);
-        return 6;
-    }
-
-    std::vector<BYTE> dmMem((size_t)dmSize, 0);
-    DEVMODEW* dm = reinterpret_cast<DEVMODEW*>(dmMem.data());
-    DocumentPropertiesW(nullptr, hPrinter, printerBuf.data(), dm, nullptr, DM_OUT_BUFFER);
-
-    if (duplexMode != 0) {
-        dm->dmFields |= DM_DUPLEX;
-        dm->dmDuplex = duplexMode;
-    }
-    DocumentPropertiesW(nullptr, hPrinter, printerBuf.data(), dm, dm, DM_IN_BUFFER | DM_OUT_BUFFER);
-
-    HDC hdc = CreateDCW(L"WINSPOOL", printerBuf.data(), nullptr, dm);
-    ClosePrinter(hPrinter);
+    std::vector<BYTE> dmMem;
+    HDC hdc = CreatePrinterDCWithDuplex(printerName, duplexMode, dmMem);
     if (!hdc) {
-        fwprintf(stderr, L"[ERROR] CreateDCW failed.\n");
+        fwprintf(stderr, L"[ERROR] CreateDCW failed (GetLastError=%lu).\n", GetLastError());
         FPDF_CloseDocument(doc);
         return 7;
     }
@@ -281,12 +303,33 @@ int wmain(int argc, wchar_t* argv[]) {
     wprintf(L"[Print] Printer: %ls | Duplex: %d | Pages: %d | File: %ls\n",
             printerName.c_str(), (int)duplexMode, pageCount, docTitle.c_str());
 
-    if (StartDocW(hdc, &di) <= 0) {
-        fwprintf(stderr, L"[ERROR] StartDocW failed.\n");
+    SetLastError(0);
+    int jobId = StartDocW(hdc, &di);
+    if (jobId <= 0) {
+        DWORD err1 = GetLastError();
         DeleteDC(hdc);
-        FPDF_CloseDocument(doc);
-        return 8;
+        dmMem.assign(sizeof(DEVMODEW), 0);
+        DEVMODEW* stdDm = reinterpret_cast<DEVMODEW*>(dmMem.data());
+        stdDm->dmSize = sizeof(DEVMODEW);
+        if (duplexMode != 0) {
+            stdDm->dmFields = DM_DUPLEX;
+            stdDm->dmDuplex = duplexMode;
+        }
+        hdc = CreateDCW(L"WINSPOOL", printerName.c_str(), nullptr, stdDm);
+        if (hdc) {
+            SetLastError(0);
+            jobId = StartDocW(hdc, &di);
+        }
+        if (jobId <= 0) {
+            DWORD err2 = GetLastError();
+            fwprintf(stderr, L"[ERROR] StartDocW failed (err1=%lu, err2=%lu).\n", err1, err2);
+            if (hdc) DeleteDC(hdc);
+            FPDF_CloseDocument(doc);
+            return 8;
+        }
     }
+
+    DEVMODEW* dm = reinterpret_cast<DEVMODEW*>(dmMem.data());
 
     for (int i = 0; i < pageCount; ++i) {
         FPDF_PAGE page = FPDF_LoadPage(doc, i);
